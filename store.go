@@ -10,6 +10,19 @@ import "errors"
 // does not exist. Callers should use [errors.Is] to check for it.
 var ErrKeyNotFound = errors.New("key not found")
 
+// Registry provides access to named [Store] instances. Runtime
+// adapters implement this to bridge their storage backend to the
+// shared library. The Beats adapter does not use Registry (it
+// opens stores through its own kvstore layer); the OTel receiver
+// resolves a storage extension and type-asserts it to Registry.
+//
+// Implementations are responsible for the lifecycle of returned
+// stores. Registry does not define a Close method; the adapter's
+// runtime (e.g. OTel extension shutdown) handles cleanup.
+type Registry interface {
+	Store(name string) (Store, error)
+}
+
 // Store is a key-value store for provider state. The shared library
 // reads and writes state through this interface; adapter layers
 // supply implementations backed by their runtime's storage (bbolt
