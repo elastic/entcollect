@@ -29,10 +29,9 @@ type Token struct {
 	Expires time.Time `json:"expires"`
 }
 
-// valid reports whether the token has not expired, accounting for a grace
-// period subtracted from the expiry.
+// valid reports whether the token will remain valid for at least grace longer.
 func (t Token) valid(grace time.Duration) bool {
-	return t.Token != "" && !t.Expires.IsZero() && t.Expires.After(time.Now().Add(-grace))
+	return t.Token != "" && !t.Expires.IsZero() && time.Until(t.Expires) > grace
 }
 
 // GetToken obtains a bearer token for the Jamf tenant using basic auth.
@@ -114,12 +113,9 @@ type Location struct {
 // page is zero-indexed. If pageSize is zero, the server's default page size
 // is used and the page parameter is omitted.
 func GetComputers(ctx context.Context, client *http.Client, tenant string, tok Token, page, pageSize int) (Computers, error) {
-	var q url.Values
+	q := url.Values{"page": {strconv.Itoa(page)}}
 	if pageSize > 0 {
-		q = url.Values{
-			"page":      {strconv.Itoa(page)},
-			"page-size": {strconv.Itoa(pageSize)},
-		}
+		q.Set("page-size", strconv.Itoa(pageSize))
 	}
 	u := &url.URL{Scheme: "https", Host: tenant, Path: "/api/preview/computers", RawQuery: q.Encode()}
 
