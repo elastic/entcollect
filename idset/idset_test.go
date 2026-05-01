@@ -177,6 +177,38 @@ func TestRehashOnShardCountChange(t *testing.T) {
 	if len(missing) != 1 || missing[0] != "gamma" {
 		t.Errorf("Missing() after rehash = %v; want [gamma]", missing)
 	}
+	if err := s3.Save(store); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load with 2 shards (reduction); should also rehash transparently.
+	s4 := New(2)
+	if err := s4.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	remaining := []string{"alpha", "beta", "delta", "epsilon"}
+	for _, id := range remaining {
+		s4.Add(id)
+	}
+	missing = s4.Missing()
+	if len(missing) != 0 {
+		t.Errorf("Missing() after shard reduction = %v; want empty", missing)
+	}
+
+	// Drop one more to confirm deletion detection after reduction.
+	s5 := New(2)
+	if err := s5.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range remaining {
+		if id != "delta" {
+			s5.Add(id)
+		}
+	}
+	missing = s5.Missing()
+	if len(missing) != 1 || missing[0] != "delta" {
+		t.Errorf("Missing() after shard reduction = %v; want [delta]", missing)
+	}
 }
 
 func TestDirtyTrackingMinimalWrites(t *testing.T) {
@@ -259,6 +291,61 @@ func TestSaveCleansEmptyShards(t *testing.T) {
 	err := store.Get(key, &ids)
 	if err == nil {
 		t.Errorf("shard %d still exists with %v after all entities removed", idx, ids)
+	}
+}
+
+func TestWasPresent(t *testing.T) {
+	store := newTestStore()
+
+	s1 := New(4)
+	if err := s1.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	s1.Add("a")
+	s1.Add("b")
+	if err := s1.Save(store); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second sync: load previous state.
+	s2 := New(4)
+	if err := s2.Load(store); err != nil {
+		t.Fatal(err)
+	}
+
+	// WasPresent reports prev-set membership before and after Add.
+	if !s2.WasPresent("a") {
+		t.Errorf("WasPresent(a) = false before Add; want true")
+	}
+	if s2.WasPresent("c") {
+		t.Errorf("WasPresent(c) = true before Add; want false (never seen)")
+	}
+
+	s2.Add("a")
+	s2.Add("c")
+
+	// Add must not change prev-set membership.
+	if !s2.WasPresent("a") {
+		t.Errorf("WasPresent(a) = false after Add; want true")
+	}
+	if s2.WasPresent("c") {
+		t.Errorf("WasPresent(c) = true after Add; want false (not in prev)")
+	}
+
+	// b was not Added this sync, so it should be Missing and not WasPresent after re-load.
+	if err := s2.Save(store); err != nil {
+		t.Fatal(err)
+	}
+
+	s3 := New(4)
+	if err := s3.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	if s3.WasPresent("b") {
+		t.Errorf("WasPresent(b) = true in s3; want false (b was removed in s2)")
+	}
+	if !s3.WasPresent("c") {
+		t.Errorf("WasPresent(c) = false in s3; want true (c was added in s2)")
 	}
 }
 

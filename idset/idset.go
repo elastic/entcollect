@@ -153,6 +153,14 @@ func (s *Set) Add(id string) {
 	}
 }
 
+// WasPresent reports whether id was present in the previous sync (the set
+// loaded from the store). It can be called before or after [Set.Add].
+func (s *Set) WasPresent(id string) bool {
+	idx := shard(id, s.shards)
+	_, ok := s.prev[idx][id]
+	return ok
+}
+
 // Missing returns IDs that were in the loaded (previous sync) set
 // but were not Add-ed during the current sync. The returned slice
 // is sorted for deterministic output.
