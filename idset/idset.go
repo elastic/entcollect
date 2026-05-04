@@ -26,11 +26,20 @@ import (
 	"github.com/elastic/entcollect"
 )
 
-const metaKey = "idset.meta"
-
 // meta is the persisted metadata for a Set.
 type meta struct {
 	Shards int `json:"shards"`
+}
+
+// Option configures a [Set].
+type Option func(*Set)
+
+// WithPrefix sets the key prefix for all store keys written by this
+// Set. When multiple Sets share the same [entcollect.Store], each
+// should use a distinct prefix to avoid key collisions. The default
+// prefix is empty, which is backward-compatible with existing usage.
+func WithPrefix(p string) Option {
+	return func(s *Set) { s.prefix = p }
 }
 
 // Set is a sharded ID set for deletion detection. It tracks which
@@ -40,6 +49,7 @@ type meta struct {
 // [Set.Missing] returns IDs that were present before but not added
 // this time; these are candidates for deletion events.
 type Set struct {
+	prefix string
 	shards int
 
 	// prev holds the ID sets loaded from the store (previous sync).
@@ -54,16 +64,24 @@ type Set struct {
 
 // New returns a Set that distributes IDs across n shards.
 // The shard count must be at least 1.
-func New(n int) *Set {
+func New(n int, opts ...Option) *Set {
 	if n < 1 {
 		n = 1
 	}
-	return &Set{
+	s := &Set{
 		shards: n,
 		prev:   make([]map[string]struct{}, n),
 		curr:   make([]map[string]struct{}, n),
 		dirty:  make([]bool, n),
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+func (s *Set) metaKey() string {
+	return s.prefix + "idset.meta"
 }
 
 // Load reads the previous sync's shard data from the store. If the
@@ -72,7 +90,7 @@ func New(n int) *Set {
 // re-hashes all IDs into the new shard layout.
 func (s *Set) Load(store entcollect.Store) error {
 	var m meta
-	err := store.Get(metaKey, &m)
+	err := store.Get(s.metaKey(), &m)
 	if errors.Is(err, entcollect.ErrKeyNotFound) {
 		return nil
 	}
@@ -86,8 +104,8 @@ func (s *Set) Load(store entcollect.Store) error {
 	return s.loadRehash(store, m.Shards)
 }
 
-func shardKey(i int) string {
-	return "idset.shard." + strconv.Itoa(i)
+func (s *Set) shardKey(i int) string {
+	return s.prefix + "idset.shard." + strconv.Itoa(i)
 }
 
 func shard(id string, n int) int {
@@ -99,7 +117,7 @@ func shard(id string, n int) int {
 func (s *Set) loadDirect(store entcollect.Store, n int) error {
 	for i := range n {
 		var ids []string
-		err := store.Get(shardKey(i), &ids)
+		err := store.Get(s.shardKey(i), &ids)
 		if errors.Is(err, entcollect.ErrKeyNotFound) {
 			continue
 		}
@@ -118,7 +136,7 @@ func (s *Set) loadDirect(store entcollect.Store, n int) error {
 func (s *Set) loadRehash(store entcollect.Store, oldCount int) error {
 	for i := range oldCount {
 		var ids []string
-		err := store.Get(shardKey(i), &ids)
+		err := store.Get(s.shardKey(i), &ids)
 		if errors.Is(err, entcollect.ErrKeyNotFound) {
 			continue
 		}
@@ -205,7 +223,7 @@ func (s *Set) Save(store entcollect.Store) error {
 		}
 	}
 
-	err := store.Set(metaKey, meta{Shards: s.shards})
+	err := store.Set(s.metaKey(), meta{Shards: s.shards})
 	if err != nil {
 		return fmt.Errorf("idset save meta: %w", err)
 	}
@@ -216,7 +234,7 @@ func (s *Set) Save(store entcollect.Store) error {
 		}
 		curr := s.curr[i]
 		if len(curr) == 0 {
-			err := store.Delete(shardKey(i))
+			err := store.Delete(s.shardKey(i))
 			if err != nil {
 				return fmt.Errorf("idset delete shard %d: %w", i, err)
 			}
@@ -227,7 +245,7 @@ func (s *Set) Save(store entcollect.Store) error {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		err := store.Set(shardKey(i), ids)
+		err := store.Set(s.shardKey(i), ids)
 		if err != nil {
 			return fmt.Errorf("idset save shard %d: %w", i, err)
 		}

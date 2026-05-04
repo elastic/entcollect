@@ -7,6 +7,7 @@ package idset
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/elastic/entcollect"
@@ -34,7 +35,7 @@ func TestEmptyFirstRun(t *testing.T) {
 
 	// Verify data was persisted.
 	var m meta
-	if err := store.Get(metaKey, &m); err != nil {
+	if err := store.Get("idset.meta", &m); err != nil {
 		t.Fatalf("Get meta: %v", err)
 	}
 	if m.Shards != 4 {
@@ -286,7 +287,7 @@ func TestSaveCleansEmptyShards(t *testing.T) {
 
 	// The shard that held x should be deleted.
 	idx := shard("x", 4)
-	key := shardKey(idx)
+	key := "idset.shard." + strconv.Itoa(idx)
 	var ids []string
 	err := store.Get(key, &ids)
 	if err == nil {
@@ -393,4 +394,91 @@ func (s *testStore) Each(fn func(string, func(any) error) (bool, error)) error {
 		}
 	}
 	return nil
+}
+
+func TestPrefixIsolation(t *testing.T) {
+	store := newTestStore()
+
+	// Two prefixed sets sharing the same store.
+	users := New(4, WithPrefix("users."))
+	devices := New(4, WithPrefix("devices."))
+
+	if err := users.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := devices.Load(store); err != nil {
+		t.Fatal(err)
+	}
+
+	users.Add("alice")
+	users.Add("bob")
+	devices.Add("host-1")
+
+	if err := users.Save(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := devices.Save(store); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reload and verify isolation: removing alice from users should
+	// not affect devices, and vice versa.
+	users2 := New(4, WithPrefix("users."))
+	devices2 := New(4, WithPrefix("devices."))
+
+	if err := users2.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := devices2.Load(store); err != nil {
+		t.Fatal(err)
+	}
+
+	users2.Add("bob") // alice gone
+	devices2.Add("host-1")
+
+	missingUsers := users2.Missing()
+	if len(missingUsers) != 1 || missingUsers[0] != "alice" {
+		t.Errorf("users Missing() = %v; want [alice]", missingUsers)
+	}
+
+	missingDevices := devices2.Missing()
+	if len(missingDevices) != 0 {
+		t.Errorf("devices Missing() = %v; want empty", missingDevices)
+	}
+}
+
+func TestPrefixDefaultEmpty(t *testing.T) {
+	store := newTestStore()
+
+	// Unprefixed set should use bare keys (backward compatible).
+	s := New(4)
+	if err := s.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	s.Add("x")
+	if err := s.Save(store); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the meta key is the bare "idset.meta".
+	var m meta
+	if err := store.Get("idset.meta", &m); err != nil {
+		t.Fatalf("bare meta key not found: %v", err)
+	}
+	if m.Shards != 4 {
+		t.Errorf("meta.Shards = %d; want 4", m.Shards)
+	}
+
+	// Prefixed set should NOT see the bare keys.
+	prefixed := New(4, WithPrefix("other."))
+	if err := prefixed.Load(store); err != nil {
+		t.Fatal(err)
+	}
+	prefixed.Add("y")
+
+	// "x" should not appear as missing because prefixed never saw it.
+	missing := prefixed.Missing()
+	if len(missing) != 0 {
+		t.Errorf("prefixed Missing() = %v; want empty (should not see bare keys)", missing)
+	}
 }
