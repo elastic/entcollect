@@ -1,10 +1,13 @@
 module github.com/elastic/entcollect
 
-go 1.25
+go 1.25.0
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-ldap/ldap/v3 v3.4.13
 	github.com/jimlambrt/gldap v0.1.14
+	golang.org/x/oauth2 v0.36.0
+	golang.org/x/time v0.15.0
 )
 
 require (
