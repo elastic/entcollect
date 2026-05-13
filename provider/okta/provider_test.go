@@ -70,7 +70,7 @@ func TestFullSync_UsersWithBulkFetchGroups(t *testing.T) {
 	}
 
 	var cursor time.Time
-	if err := store.Get("okta.cursor.last_sync", &cursor); err != nil {
+	if err := store.Get("okta.cursor.user.last_sync", &cursor); err != nil {
 		t.Errorf("get cursor: %v", err)
 	}
 	if cursor.IsZero() {
@@ -373,7 +373,7 @@ func TestIncrementalSync_PerUserGroups(t *testing.T) {
 	}
 
 	var cursor time.Time
-	if err := store.Get("okta.cursor.last_update", &cursor); err != nil {
+	if err := store.Get("okta.cursor.user.last_update", &cursor); err != nil {
 		t.Errorf("get last_update cursor: %v", err)
 	}
 	if cursor.IsZero() {

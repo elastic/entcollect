@@ -36,8 +36,10 @@ import (
 )
 
 const (
-	keyCursorLastSync   = "okta.cursor.last_sync"
-	keyCursorLastUpdate = "okta.cursor.last_update"
+	keyCursorUserLastSync     = "okta.cursor.user.last_sync"
+	keyCursorUserLastUpdate   = "okta.cursor.user.last_update"
+	keyCursorDeviceLastSync   = "okta.cursor.device.last_sync"
+	keyCursorDeviceLastUpdate = "okta.cursor.device.last_update"
 )
 
 // Provider syncs Okta identities via the entcollect.Provider interface.
@@ -69,7 +71,6 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 	lim := NewRateLimiter(p.cfg.LimitWindow, p.cfg.LimitFixed)
 	now := time.Now().UTC()
 	enrich := p.cfg.enrichmentSet()
-	var latestLastUpdated time.Time
 
 	if p.cfg.wantUsers() {
 		users := idset.New(p.cfg.IDSetShards, idset.WithPrefix("okta.users."))
@@ -77,12 +78,9 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 			return fmt.Errorf("okta: load users idset: %w", err)
 		}
 
-		allUsers, latest, err := p.fetchAllUsers(ctx, cli, key, lim, log)
+		allUsers, latestUser, err := p.fetchAllUsers(ctx, cli, key, lim, log)
 		if err != nil {
 			return err
-		}
-		if latest.After(latestLastUpdated) {
-			latestLastUpdated = latest
 		}
 
 		var groupMapping map[string][]Group
@@ -149,6 +147,11 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		if err := users.Save(store); err != nil {
 			return fmt.Errorf("okta: save users idset: %w", err)
 		}
+		if !latestUser.IsZero() {
+			if err := store.Set(keyCursorUserLastSync, latestUser); err != nil {
+				return fmt.Errorf("okta: set user cursor: %w", err)
+			}
+		}
 	}
 
 	if p.cfg.wantDevices() {
@@ -162,9 +165,14 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 			return err
 		}
 
+		var latestDevice time.Time
 		for i := range allDevices {
 			d := &allDevices[i]
 			devices.Add(d.ID)
+
+			if d.LastUpdated.After(latestDevice) {
+				latestDevice = d.LastUpdated
+			}
 
 			devUsers, _, err := GetDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
 			if err != nil {
@@ -203,13 +211,13 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		if err := devices.Save(store); err != nil {
 			return fmt.Errorf("okta: save devices idset: %w", err)
 		}
-	}
-
-	if !latestLastUpdated.IsZero() {
-		if err := store.Set(keyCursorLastSync, latestLastUpdated); err != nil {
-			return fmt.Errorf("okta: set cursor: %w", err)
+		if !latestDevice.IsZero() {
+			if err := store.Set(keyCursorDeviceLastSync, latestDevice); err != nil {
+				return fmt.Errorf("okta: set device cursor: %w", err)
+			}
 		}
 	}
+
 	return nil
 }
 
@@ -218,20 +226,6 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 // "deleted", so running the idset would cause false deletions on the next
 // full sync.
 func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, pub entcollect.Publisher, log *slog.Logger) error {
-	var since time.Time
-	err := store.Get(keyCursorLastUpdate, &since)
-	if err != nil && !isKeyNotFound(err) {
-		return fmt.Errorf("okta: get cursor: %w", err)
-	}
-	if since.IsZero() {
-		// Fall back to last_sync if last_update hasn't been written yet
-		// (first incremental after a full sync).
-		err = store.Get(keyCursorLastSync, &since)
-		if err != nil && !isKeyNotFound(err) {
-			return fmt.Errorf("okta: get cursor: %w", err)
-		}
-	}
-
 	cli, key, err := p.authClient(ctx)
 	if err != nil {
 		return fmt.Errorf("okta: auth: %w", err)
@@ -239,22 +233,23 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 	lim := NewRateLimiter(p.cfg.LimitWindow, p.cfg.LimitFixed)
 	now := time.Now().UTC()
 	enrich := p.cfg.enrichmentSet()
-	var latestLastUpdated time.Time
 
 	if p.cfg.wantUsers() {
+		userSince, err := loadCursor(store, keyCursorUserLastUpdate, keyCursorUserLastSync)
+		if err != nil {
+			return err
+		}
+
 		query := url.Values{}
-		if !since.IsZero() {
-			query.Set("search", fmt.Sprintf(`lastUpdated ge "%s" and status pr`, since.Format(ISO8601)))
+		if !userSince.IsZero() {
+			query.Set("search", fmt.Sprintf(`lastUpdated ge "%s" and status pr`, userSince.Format(ISO8601)))
 		} else {
 			query.Set("search", "status pr")
 		}
 
-		users, latest, err := p.paginateUsers(ctx, cli, key, query, lim, log)
+		users, latestUser, err := p.paginateUsers(ctx, cli, key, query, lim, log)
 		if err != nil {
 			return err
-		}
-		if latest.After(latestLastUpdated) {
-			latestLastUpdated = latest
 		}
 
 		var supervisesMapping map[string][]SupervisedUser
@@ -295,12 +290,23 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 				return fmt.Errorf("okta: publish user: %w", err)
 			}
 		}
+
+		if !latestUser.IsZero() {
+			if err := store.Set(keyCursorUserLastUpdate, latestUser); err != nil {
+				return fmt.Errorf("okta: set user cursor: %w", err)
+			}
+		}
 	}
 
 	if p.cfg.wantDevices() {
+		deviceSince, err := loadCursor(store, keyCursorDeviceLastUpdate, keyCursorDeviceLastSync)
+		if err != nil {
+			return err
+		}
+
 		query := url.Values{}
-		if !since.IsZero() {
-			query.Set("search", fmt.Sprintf(`lastUpdated ge "%s" and status pr`, since.Format(ISO8601)))
+		if !deviceSince.IsZero() {
+			query.Set("search", fmt.Sprintf(`lastUpdated ge "%s" and status pr`, deviceSince.Format(ISO8601)))
 		}
 
 		devices, err := p.paginateDevices(ctx, cli, key, query, lim, log)
@@ -308,8 +314,12 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 			return err
 		}
 
+		var latestDevice time.Time
 		for i := range devices {
 			d := &devices[i]
+			if d.LastUpdated.After(latestDevice) {
+				latestDevice = d.LastUpdated
+			}
 			devUsers, _, err := GetDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
 			if err != nil {
 				return fmt.Errorf("okta: get device users for %s: %w", d.ID, err)
@@ -326,14 +336,33 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 				return fmt.Errorf("okta: publish device: %w", err)
 			}
 		}
-	}
 
-	if !latestLastUpdated.IsZero() {
-		if err := store.Set(keyCursorLastUpdate, latestLastUpdated); err != nil {
-			return fmt.Errorf("okta: set cursor: %w", err)
+		if !latestDevice.IsZero() {
+			if err := store.Set(keyCursorDeviceLastUpdate, latestDevice); err != nil {
+				return fmt.Errorf("okta: set device cursor: %w", err)
+			}
 		}
 	}
+
 	return nil
+}
+
+// loadCursor reads the incremental update cursor, falling back to the
+// full sync cursor if no incremental value has been written yet.
+func loadCursor(store entcollect.Store, updateKey, syncKey string) (time.Time, error) {
+	var t time.Time
+	err := store.Get(updateKey, &t)
+	if err != nil && !isKeyNotFound(err) {
+		return time.Time{}, fmt.Errorf("okta: get cursor %s: %w", updateKey, err)
+	}
+	if !t.IsZero() {
+		return t, nil
+	}
+	err = store.Get(syncKey, &t)
+	if err != nil && !isKeyNotFound(err) {
+		return time.Time{}, fmt.Errorf("okta: get cursor %s: %w", syncKey, err)
+	}
+	return t, nil
 }
 
 // authClient returns an HTTP client and API key for requests. For token
@@ -445,6 +474,9 @@ func (p *Provider) paginateGroups(ctx context.Context, cli *http.Client, key str
 func (p *Provider) paginateGroupMembers(ctx context.Context, cli *http.Client, key, groupID string, lim *RateLimiter, log *slog.Logger) ([]User, error) {
 	var all []User
 	query := url.Values{}
+	if p.cfg.BatchSize > 0 {
+		query.Set("limit", fmt.Sprint(p.cfg.BatchSize))
+	}
 	for {
 		batch, headers, err := GetGroupMembers(ctx, cli, p.cfg.Domain, key, groupID, query, lim, log)
 		if err != nil {

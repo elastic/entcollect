@@ -296,6 +296,8 @@ func GetUserRoles(ctx context.Context, cli *http.Client, host, key, userID strin
 }
 
 // GetRolePermissions returns the permissions for a custom role.
+// The Okta API returns a single object {"permissions":[...]} here,
+// not a JSON array, so we use getSingle rather than get.
 func GetRolePermissions(ctx context.Context, cli *http.Client, host, key, roleID string, lim *RateLimiter, log *slog.Logger) ([]Permission, http.Header, error) {
 	if roleID == "" {
 		return nil, nil, errors.New("no role ID specified")
@@ -303,11 +305,11 @@ func GetRolePermissions(ctx context.Context, cli *http.Client, host, key, roleID
 	const endpoint = "/api/v1/iam/roles/{roleId}/permissions"
 	path := strings.Replace(endpoint, "{roleId}", roleID, 1)
 	u := &url.URL{Scheme: "https", Host: host, Path: path}
-	result, h, err := get[permissionsWrapper](ctx, cli, u, endpoint, key, OmitNone, lim, log)
-	if err != nil || len(result) == 0 {
+	result, h, err := getSingle[permissionsWrapper](ctx, cli, u, endpoint, key, lim, log)
+	if err != nil {
 		return nil, h, err
 	}
-	return result[0].Permissions, h, nil
+	return result.Permissions, h, nil
 }
 
 // GetDevices returns devices from the Okta list devices API.
@@ -357,7 +359,38 @@ func GetUserDevices(ctx context.Context, cli *http.Client, host, key, userID str
 }
 
 // get is the generic HTTP request function for the Okta API.
+// It unmarshals the JSON response body as an array of E.
 func get[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, omit Response, lim *RateLimiter, log *slog.Logger) ([]E, http.Header, error) {
+	body, h, err := doRequest(ctx, cli, u, endpoint, key, omit, lim, log)
+	if err != nil {
+		return nil, h, err
+	}
+	var e []E
+	if err := json.Unmarshal(body, &e); err != nil {
+		return nil, nil, recoverError(body)
+	}
+	return e, h, nil
+}
+
+// getSingle is like get but unmarshals the response as a single JSON
+// object rather than an array. Use for endpoints that return an object
+// wrapping a nested array (e.g. /api/v1/iam/roles/{roleId}/permissions).
+func getSingle[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, lim *RateLimiter, log *slog.Logger) (E, http.Header, error) {
+	var zero E
+	body, h, err := doRequest(ctx, cli, u, endpoint, key, OmitNone, lim, log)
+	if err != nil {
+		return zero, h, err
+	}
+	var e E
+	if err := json.Unmarshal(body, &e); err != nil {
+		return zero, nil, recoverError(body)
+	}
+	return e, h, nil
+}
+
+// doRequest executes an HTTP GET with retries, rate limiting, and
+// exponential backoff. It returns the raw response body on success.
+func doRequest(ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, omit Response, lim *RateLimiter, log *slog.Logger) ([]byte, http.Header, error) {
 	target := u.String()
 	for attempt := range maxRetryAttempts {
 		if attempt > 0 {
@@ -422,11 +455,7 @@ func get[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, 
 			return nil, resp.Header, recoverError(body.Bytes())
 		}
 
-		var e []E
-		if err := json.Unmarshal(body.Bytes(), &e); err != nil {
-			return nil, nil, recoverError(body.Bytes())
-		}
-		return e, resp.Header, nil
+		return body.Bytes(), resp.Header, nil
 	}
 	return nil, nil, fmt.Errorf("all %d attempts failed", maxRetryAttempts)
 }

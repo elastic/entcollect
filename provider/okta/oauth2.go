@@ -102,6 +102,10 @@ func (ts *jwtTokenSource) Token() (*oauth2.Token, error) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
+	if ts.token != nil && ts.token.Valid() {
+		return ts.token, nil
+	}
+
 	signed, err := generateJWT(ts.jwk, ts.conf)
 	if err != nil {
 		return nil, fmt.Errorf("generate JWT: %w", err)
@@ -110,6 +114,7 @@ func (ts *jwtTokenSource) Token() (*oauth2.Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("exchange JWT for bearer token: %w", err)
 	}
+	ts.token = token
 	return token, nil
 }
 
