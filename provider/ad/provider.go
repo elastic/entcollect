@@ -45,6 +45,8 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ad: parse base DN: %w", err)
 	}
+	cfg.UserAttrs = withMandatory(cfg.UserAttrs, "distinguishedName", "whenChanged")
+	cfg.GrpAttrs = withMandatory(cfg.GrpAttrs, "distinguishedName", "whenChanged")
 	return &Provider{cfg: cfg, baseDN: base}, nil
 }
 
