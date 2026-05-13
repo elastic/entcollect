@@ -94,6 +94,24 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// withMandatory ensures attrs contains the listed names. If attrs is
+// nil or empty the LDAP search returns all attributes, so nothing is added.
+func withMandatory(attrs []string, include ...string) []string {
+	if len(attrs) == 0 {
+		return nil
+	}
+outer:
+	for _, m := range include {
+		for _, a := range attrs {
+			if m == a {
+				continue outer
+			}
+		}
+		attrs = append(attrs, m)
+	}
+	return attrs
+}
+
 func (c *Config) wantUsers() bool {
 	switch strings.ToLower(c.Dataset) {
 	case "", "all", "users":

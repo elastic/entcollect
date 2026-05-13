@@ -190,6 +190,59 @@ func TestCollateEntityKey(t *testing.T) {
 	})
 }
 
+func TestWithMandatory(t *testing.T) {
+	tests := []struct {
+		name    string
+		attrs   []string
+		include []string
+		want    []string
+	}{
+		{
+			name:    "nil attrs returns nil",
+			attrs:   nil,
+			include: []string{"distinguishedName", "whenChanged"},
+			want:    nil,
+		},
+		{
+			name:    "empty attrs returns nil",
+			attrs:   []string{},
+			include: []string{"distinguishedName", "whenChanged"},
+			want:    nil,
+		},
+		{
+			name:    "missing attrs are appended",
+			attrs:   []string{"cn", "mail"},
+			include: []string{"distinguishedName", "whenChanged"},
+			want:    []string{"cn", "mail", "distinguishedName", "whenChanged"},
+		},
+		{
+			name:    "already present attrs are not duplicated",
+			attrs:   []string{"cn", "distinguishedName", "whenChanged"},
+			include: []string{"distinguishedName", "whenChanged"},
+			want:    []string{"cn", "distinguishedName", "whenChanged"},
+		},
+		{
+			name:    "partial overlap",
+			attrs:   []string{"cn", "whenChanged"},
+			include: []string{"distinguishedName", "whenChanged"},
+			want:    []string{"cn", "whenChanged", "distinguishedName"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := withMandatory(test.attrs, test.include...)
+			if len(got) != len(test.want) {
+				t.Fatalf("withMandatory() = %v, want %v", got, test.want)
+			}
+			for i := range got {
+				if got[i] != test.want[i] {
+					t.Errorf("withMandatory()[%d] = %q, want %q", i, got[i], test.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestGetDetailsInvalidEntTyp(t *testing.T) {
 	base, err := ldap.ParseDN("DC=example,DC=com")
 	if err != nil {

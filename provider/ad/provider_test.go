@@ -502,6 +502,56 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+func TestFullSync_ConfiguredAttrsHaveIDsAndCursor(t *testing.T) {
+	fix := &ldapFixture{
+		users: []ldapEntry{
+			{
+				dn: "cn=alice,dc=example,dc=com",
+				attrs: map[string][]string{
+					"cn":                {"alice"},
+					"distinguishedName": {"cn=alice,dc=example,dc=com"},
+					"mail":              {"alice@example.com"},
+					"whenChanged":       {"20260101120000.0Z"},
+				},
+			},
+		},
+	}
+
+	url := startTestLDAPServer(t, fix)
+
+	cfg := ad.DefaultConfig()
+	cfg.URL = url
+	cfg.BaseDN = "DC=example,DC=com"
+	cfg.User = "cn=admin,dc=example,dc=com"
+	cfg.Password = "pass"
+	cfg.Dataset = "users"
+	cfg.UserAttrs = []string{"cn", "mail"}
+
+	p, err := ad.New(cfg)
+	if err != nil {
+		t.Fatalf("ad.New: %v", err)
+	}
+
+	store := newMemStore()
+	docs := collectDocs(t.Context(), t, p, store, true)
+	if len(docs) == 0 {
+		t.Fatal("expected at least one document")
+	}
+	for _, doc := range docs {
+		if doc.ID == "" {
+			t.Error("document has empty ID; distinguishedName should be mandatory")
+		}
+	}
+
+	var cursor time.Time
+	if err := store.Get("ad.cursor.when_changed", &cursor); err != nil {
+		t.Fatalf("cursor not written: %v", err)
+	}
+	if cursor.IsZero() {
+		t.Error("cursor is zero; whenChanged should be mandatory")
+	}
+}
+
 func collectDocs(ctx context.Context, t *testing.T, p *ad.Provider, store entcollect.Store, full bool) []entcollect.Document {
 	t.Helper()
 	var docs []entcollect.Document
