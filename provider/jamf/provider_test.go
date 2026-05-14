@@ -111,7 +111,7 @@ func (fs *fakeServer) handler() http.Handler {
 		}
 
 		resp := struct {
-			TotalCount int            `json:"totalCount"`
+			TotalCount int             `json:"totalCount"`
 			Results    []jamf.Computer `json:"results"`
 		}{
 			TotalCount: total,
@@ -175,7 +175,7 @@ func (w *testLogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func boolPtr(b bool) *bool { return &b }
+func boolPtr(b bool) *bool    { return &b }
 func strPtr(s string) *string { return &s }
 
 func TestFullSync_FirstRun(t *testing.T) {

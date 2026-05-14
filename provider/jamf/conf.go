@@ -41,12 +41,12 @@ func DefaultConfig() Config {
 }
 
 var (
-	errMissingTenant       = errors.New("jamf_tenant is required")
-	errMissingUsername     = errors.New("jamf_username is required")
-	errMissingPassword     = errors.New("jamf_password is required")
-	errInvalidSync         = errors.New("sync_interval must be positive")
-	errInvalidUpdate       = errors.New("update_interval must be positive")
-	errSyncNotLonger       = errors.New("sync_interval must be greater than update_interval")
+	errMissingTenant   = errors.New("jamf_tenant is required")
+	errMissingUsername = errors.New("jamf_username is required")
+	errMissingPassword = errors.New("jamf_password is required")
+	errInvalidSync     = errors.New("sync_interval must be positive")
+	errInvalidUpdate   = errors.New("update_interval must be positive")
+	errSyncNotLonger   = errors.New("sync_interval must be greater than update_interval")
 )
 
 // Validate returns an error if the Config is invalid.
