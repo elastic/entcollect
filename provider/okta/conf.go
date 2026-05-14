@@ -61,6 +61,12 @@ var (
 	errSyncNotLonger     = errors.New("sync_interval must be greater than update_interval")
 	errInvalidDataset    = errors.New("dataset must be 'all', 'users', 'devices' or empty")
 	errInvalidEnrichment = errors.New("unknown enrich_with value")
+
+	errOAuth2MissingClientID = errors.New("oauth2: client_id is required")
+	errOAuth2MissingTokenURL = errors.New("oauth2: token_url is required")
+	errOAuth2MissingScopes   = errors.New("oauth2: scopes is required")
+	errOAuth2NoCreds         = errors.New("oauth2: exactly one of client_secret or jwk is required")
+	errOAuth2BothCreds       = errors.New("oauth2: cannot specify both client_secret and jwk")
 )
 
 var validEnrichments = map[string]bool{
@@ -97,6 +103,11 @@ func (c *Config) Validate() error {
 	for _, e := range c.EnrichWith {
 		if !validEnrichments[strings.ToLower(e)] {
 			return errInvalidEnrichment
+		}
+	}
+	if c.OAuth2 != nil {
+		if err := c.OAuth2.validate(); err != nil {
+			return err
 		}
 	}
 	return nil

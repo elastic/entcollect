@@ -460,6 +460,92 @@ func TestConfig_Validate(t *testing.T) {
 			modify:  func(c *okta.Config) { c.SyncInterval = c.UpdateInterval },
 			wantErr: true,
 		},
+		{
+			name: "valid oauth2 with secret",
+			modify: func(c *okta.Config) {
+				c.Token = ""
+				c.OAuth2 = &okta.OAuth2Config{
+					ClientID:     "client-id",
+					ClientSecret: "client-secret",
+					TokenURL:     "https://example.okta.com/oauth2/v1/token",
+					Scopes:       []string{"okta.users.read"},
+				}
+			},
+		},
+		{
+			name: "valid oauth2 with jwk",
+			modify: func(c *okta.Config) {
+				c.Token = ""
+				c.OAuth2 = &okta.OAuth2Config{
+					ClientID: "client-id",
+					TokenURL: "https://example.okta.com/oauth2/v1/token",
+					Scopes:   []string{"okta.users.read"},
+					JWK:      []byte(`{"kty":"RSA"}`),
+				}
+			},
+		},
+		{
+			name: "oauth2 missing client_id",
+			modify: func(c *okta.Config) {
+				c.Token = ""
+				c.OAuth2 = &okta.OAuth2Config{
+					ClientSecret: "secret",
+					TokenURL:     "https://example.okta.com/oauth2/v1/token",
+					Scopes:       []string{"okta.users.read"},
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name: "oauth2 missing token_url",
+			modify: func(c *okta.Config) {
+				c.Token = ""
+				c.OAuth2 = &okta.OAuth2Config{
+					ClientID:     "client-id",
+					ClientSecret: "secret",
+					Scopes:       []string{"okta.users.read"},
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name: "oauth2 missing scopes",
+			modify: func(c *okta.Config) {
+				c.Token = ""
+				c.OAuth2 = &okta.OAuth2Config{
+					ClientID:     "client-id",
+					ClientSecret: "secret",
+					TokenURL:     "https://example.okta.com/oauth2/v1/token",
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name: "oauth2 no credentials",
+			modify: func(c *okta.Config) {
+				c.Token = ""
+				c.OAuth2 = &okta.OAuth2Config{
+					ClientID: "client-id",
+					TokenURL: "https://example.okta.com/oauth2/v1/token",
+					Scopes:   []string{"okta.users.read"},
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name: "oauth2 both credentials",
+			modify: func(c *okta.Config) {
+				c.Token = ""
+				c.OAuth2 = &okta.OAuth2Config{
+					ClientID:     "client-id",
+					ClientSecret: "secret",
+					TokenURL:     "https://example.okta.com/oauth2/v1/token",
+					Scopes:       []string{"okta.users.read"},
+					JWK:          []byte(`{"kty":"RSA"}`),
+				}
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
