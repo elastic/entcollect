@@ -41,6 +41,22 @@ type OAuth2Config struct {
 	JWK          json.RawMessage `json:"jwk,omitempty"`
 }
 
+func (o *OAuth2Config) validate() error {
+	switch {
+	case o.ClientID == "":
+		return errOAuth2MissingClientID
+	case o.TokenURL == "":
+		return errOAuth2MissingTokenURL
+	case len(o.Scopes) == 0:
+		return errOAuth2MissingScopes
+	case o.ClientSecret == "" && len(o.JWK) == 0:
+		return errOAuth2NoCreds
+	case o.ClientSecret != "" && len(o.JWK) > 0:
+		return errOAuth2BothCreds
+	}
+	return nil
+}
+
 // newOAuth2Client creates an HTTP client with an OAuth2 transport.
 func newOAuth2Client(ctx context.Context, base *http.Client, cfg OAuth2Config) (*http.Client, error) {
 	oauthConfig := &oauth2.Config{
