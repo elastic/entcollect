@@ -129,4 +129,3 @@ func (b *Buffer) Discard() {
 	b.pending = make(map[string]json.RawMessage)
 	b.deleted = make(map[string]struct{})
 }
-
