@@ -6,6 +6,7 @@ package entraid
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 	"testing"
 )
@@ -173,4 +174,231 @@ func groupIDs(gs []GroupECS) []string {
 		ids[i] = g.ID
 	}
 	return ids
+}
+
+func BenchmarkMembershipGraph_Build(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		gen  func() generatedGraph
+	}{
+		{"flat/groups=100/members=10", func() generatedGraph { return generateFlatGroups(100, 10, 100) }},
+		{"flat/groups=1000/members=10", func() generatedGraph { return generateFlatGroups(1000, 10, 1000) }},
+		{"flat/groups=10000/members=10", func() generatedGraph { return generateFlatGroups(10000, 10, 1000) }},
+		{"flat/groups=1000/members=100", func() generatedGraph { return generateFlatGroups(1000, 100, 1000) }},
+		{"chain/depth=3", func() generatedGraph { return generateNestedChain(3, 100) }},
+		{"chain/depth=10", func() generatedGraph { return generateNestedChain(10, 100) }},
+		{"chain/depth=100", func() generatedGraph { return generateNestedChain(100, 100) }},
+		{"tree/fanout=3/depth=3", func() generatedGraph { return generateNestedTree(3, 3, 10) }},
+		{"tree/fanout=3/depth=5", func() generatedGraph { return generateNestedTree(3, 5, 2) }},
+		{"diamond/leaves=50/parents=50", func() generatedGraph { return generateDiamondGroups(50, 50, 100) }},
+		{"diamond/leaves=100/parents=100", func() generatedGraph { return generateDiamondGroups(100, 100, 100) }},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			gg := tc.gen()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				buildGraph(gg)
+			}
+		})
+	}
+}
+
+func BenchmarkMembershipGraph_UserTransitiveGroups(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		gen  func() generatedGraph
+	}{
+		{"flat/groups=100/direct=5", func() generatedGraph { return generateFlatGroups(100, 10, 100) }},
+		{"flat/groups=1000/direct=5", func() generatedGraph { return generateFlatGroups(1000, 10, 1000) }},
+		{"flat/groups=10000/direct=5", func() generatedGraph { return generateFlatGroups(10000, 10, 1000) }},
+		{"chain/depth=10", func() generatedGraph { return generateNestedChain(10, 1) }},
+		{"chain/depth=100", func() generatedGraph { return generateNestedChain(100, 1) }},
+		{"tree/fanout=3/depth=5", func() generatedGraph { return generateNestedTree(3, 5, 1) }},
+		{"diamond/leaves=50/parents=50", func() generatedGraph { return generateDiamondGroups(50, 50, 1) }},
+		{"diamond/leaves=100/parents=100", func() generatedGraph { return generateDiamondGroups(100, 100, 1) }},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			gg := tc.gen()
+			mg := buildGraph(gg)
+			uid := gg.userIDs[0]
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				mg.userTransitiveGroups(uid)
+			}
+		})
+	}
+}
+
+func BenchmarkMembershipGraph_AllUsers(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		gen  func() generatedGraph
+	}{
+		{"users=100/groups=100/flat", func() generatedGraph { return generateFlatGroups(100, 10, 100) }},
+		{"users=1000/groups=100/flat", func() generatedGraph { return generateFlatGroups(100, 10, 1000) }},
+		{"users=1000/groups=1000/flat", func() generatedGraph { return generateFlatGroups(1000, 10, 1000) }},
+		{"users=1000/groups=10000/flat", func() generatedGraph { return generateFlatGroups(10000, 10, 1000) }},
+		{"users=100/chain/depth=10", func() generatedGraph { return generateNestedChain(10, 100) }},
+		{"users=100/diamond/leaves=50/parents=50", func() generatedGraph { return generateDiamondGroups(50, 50, 100) }},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			gg := tc.gen()
+			mg := buildGraph(gg)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				for _, uid := range gg.userIDs {
+					mg.userTransitiveGroups(uid)
+				}
+			}
+		})
+	}
+}
+
+type generatedGraph struct {
+	groups  []Group
+	members map[string][]Member
+	userIDs []string
+}
+
+// generateFlatGroups builds nGroups flat (non-nested) groups, each with
+// usersPerGroup user members. Users are reused cyclically from a pool of
+// nUsers unique IDs, so a user can appear in multiple groups.
+func generateFlatGroups(nGroups, usersPerGroup, nUsers int) generatedGraph {
+	groups := make([]Group, nGroups)
+	members := make(map[string][]Member, nGroups)
+	for i := range nGroups {
+		gid := fmt.Sprintf("g%d", i)
+		groups[i] = Group{ID: gid, DisplayName: gid}
+		ms := make([]Member, usersPerGroup)
+		for j := range usersPerGroup {
+			ms[j] = Member{ID: fmt.Sprintf("u%d", j%nUsers), Type: odataTypeUser}
+		}
+		members[gid] = ms
+	}
+	userIDs := make([]string, nUsers)
+	for i := range nUsers {
+		userIDs[i] = fmt.Sprintf("u%d", i)
+	}
+	return generatedGraph{groups: groups, members: members, userIDs: userIDs}
+}
+
+// generateNestedChain builds a linear chain of depth groups: g0 → g1 → … → g(depth-1).
+// A single user is a member of g0 (the leaf). Transitive membership reaches
+// all groups up the chain.
+func generateNestedChain(depth, nUsers int) generatedGraph {
+	groups := make([]Group, depth)
+	members := make(map[string][]Member, depth)
+	for i := range depth {
+		gid := fmt.Sprintf("g%d", i)
+		groups[i] = Group{ID: gid, DisplayName: gid}
+	}
+	// Users are direct members of g0.
+	ms := make([]Member, nUsers)
+	userIDs := make([]string, nUsers)
+	for i := range nUsers {
+		uid := fmt.Sprintf("u%d", i)
+		ms[i] = Member{ID: uid, Type: odataTypeUser}
+		userIDs[i] = uid
+	}
+	members[groups[0].ID] = ms
+	// Each group is nested in the next: g0 is a member of g1, g1 of g2, etc.
+	for i := range depth - 1 {
+		members[groups[i+1].ID] = append(members[groups[i+1].ID], Member{
+			ID:   groups[i].ID,
+			Type: odataTypeGroup,
+		})
+	}
+	return generatedGraph{groups: groups, members: members, userIDs: userIDs}
+}
+
+// generateNestedTree builds a tree of groups with the given branching factor
+// (fanout) and depth. Users are placed in every leaf group. Total groups =
+// (fanout^depth - 1) / (fanout - 1) for fanout > 1, or depth for fanout == 1.
+func generateNestedTree(fanout, depth, nUsersPerLeaf int) generatedGraph {
+	var groups []Group
+	members := make(map[string][]Member)
+	var userIDs []string
+	uid := 0
+
+	var build func(level int) string
+	gid := 0
+	build = func(level int) string {
+		id := fmt.Sprintf("g%d", gid)
+		gid++
+		groups = append(groups, Group{ID: id, DisplayName: id})
+		if level == depth-1 {
+			ms := make([]Member, nUsersPerLeaf)
+			for i := range nUsersPerLeaf {
+				u := fmt.Sprintf("u%d", uid)
+				ms[i] = Member{ID: u, Type: odataTypeUser}
+				userIDs = append(userIDs, u)
+				uid++
+			}
+			members[id] = ms
+			return id
+		}
+		for range fanout {
+			childID := build(level + 1)
+			members[id] = append(members[id], Member{ID: childID, Type: odataTypeGroup})
+		}
+		return id
+	}
+	build(0)
+	return generatedGraph{groups: groups, members: members, userIDs: userIDs}
+}
+
+// generateDiamondGroups builds nGroups groups arranged so that many groups
+// share common parent groups, creating diamond/DAG patterns that maximise
+// BFS revisit attempts. The first half are leaf groups containing users;
+// the second half are parent groups each containing all leaf groups as
+// nested members.
+func generateDiamondGroups(nLeaves, nParents, nUsers int) generatedGraph {
+	groups := make([]Group, 0, nLeaves+nParents)
+	members := make(map[string][]Member)
+	userIDs := make([]string, nUsers)
+
+	for i := range nUsers {
+		userIDs[i] = fmt.Sprintf("u%d", i)
+	}
+
+	// Leaf groups: each contains all users.
+	leaves := make([]string, nLeaves)
+	for i := range nLeaves {
+		gid := fmt.Sprintf("leaf%d", i)
+		leaves[i] = gid
+		groups = append(groups, Group{ID: gid, DisplayName: gid})
+		ms := make([]Member, nUsers)
+		for j := range nUsers {
+			ms[j] = Member{ID: userIDs[j], Type: odataTypeUser}
+		}
+		members[gid] = ms
+	}
+
+	// Parent groups: each contains all leaves as nested group members.
+	for i := range nParents {
+		gid := fmt.Sprintf("parent%d", i)
+		groups = append(groups, Group{ID: gid, DisplayName: gid})
+		ms := make([]Member, nLeaves)
+		for j := range nLeaves {
+			ms[j] = Member{ID: leaves[j], Type: odataTypeGroup}
+		}
+		members[gid] = ms
+	}
+
+	return generatedGraph{groups: groups, members: members, userIDs: userIDs}
+}
+
+// buildGraph populates a membershipGraph from a generatedGraph fixture.
+func buildGraph(gg generatedGraph) *membershipGraph {
+	mg := newMembershipGraph()
+	for _, g := range gg.groups {
+		mg.addGroup(g)
+	}
+	for gid, ms := range gg.members {
+		mg.addMembers(gid, ms)
+	}
+	return mg
 }

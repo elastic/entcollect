@@ -14,169 +14,13 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/elastic/entcollect"
 	"github.com/elastic/entcollect/provider/jamf"
 )
-
-// memStore is a minimal in-memory Store for testing.
-type memStore struct {
-	data map[string]json.RawMessage
-}
-
-func newMemStore() *memStore {
-	return &memStore{data: make(map[string]json.RawMessage)}
-}
-
-func (m *memStore) Get(key string, dst any) error {
-	raw, ok := m.data[key]
-	if !ok {
-		return fmt.Errorf("memstore get %q: %w", key, entcollect.ErrKeyNotFound)
-	}
-	return json.Unmarshal(raw, dst)
-}
-
-func (m *memStore) Set(key string, value any) error {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	m.data[key] = raw
-	return nil
-}
-
-func (m *memStore) Delete(key string) error {
-	delete(m.data, key)
-	return nil
-}
-
-func (m *memStore) Each(fn func(string, func(any) error) (bool, error)) error {
-	for k, v := range m.data {
-		v := v
-		cont, err := fn(k, func(dst any) error { return json.Unmarshal(v, dst) })
-		if err != nil {
-			return err
-		}
-		if !cont {
-			return nil
-		}
-	}
-	return nil
-}
-
-// fakeServer holds the current list of computers served by the test server and
-// the page size it simulates.
-type fakeServer struct {
-	computers []jamf.Computer
-	pageSize  int
-}
-
-func (fs *fakeServer) handler() http.Handler {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("POST /api/v1/auth/token", func(w http.ResponseWriter, r *http.Request) {
-		tok := struct {
-			Token   string    `json:"token"`
-			Expires time.Time `json:"expires"`
-		}{
-			Token:   "test-token",
-			Expires: time.Now().Add(30 * time.Minute),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(tok) //nolint:errcheck
-	})
-
-	mux.HandleFunc("GET /api/preview/computers", func(w http.ResponseWriter, r *http.Request) {
-		all := fs.computers
-		total := len(all)
-
-		page := 0
-		pageSize := len(all)
-		if v := r.URL.Query().Get("page"); v != "" {
-			page, _ = strconv.Atoi(v)
-		}
-		if v := r.URL.Query().Get("page-size"); v != "" {
-			pageSize, _ = strconv.Atoi(v)
-		}
-
-		start := page * pageSize
-		end := start + pageSize
-		if start > total {
-			start = total
-		}
-		if end > total {
-			end = total
-		}
-
-		resp := struct {
-			TotalCount int             `json:"totalCount"`
-			Results    []jamf.Computer `json:"results"`
-		}{
-			TotalCount: total,
-			Results:    all[start:end],
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp) //nolint:errcheck
-	})
-
-	return mux
-}
-
-func newTestProvider(t *testing.T, fs *fakeServer) (*jamf.Provider, *httptest.Server, string) {
-	t.Helper()
-	srv := httptest.NewTLSServer(fs.handler())
-	t.Cleanup(srv.Close)
-
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse server URL: %v", err)
-	}
-
-	cfg := jamf.DefaultConfig()
-	cfg.TenantID = u.Host
-	cfg.Username = "user"
-	cfg.Password = "pass"
-	cfg.PageSize = fs.pageSize
-
-	p := jamf.NewWithClient(cfg, srv.Client())
-	return p, srv, u.Host
-}
-
-func collectDocs(ctx context.Context, t *testing.T, p *jamf.Provider, store entcollect.Store, full bool) []entcollect.Document {
-	t.Helper()
-	var docs []entcollect.Document
-	pub := func(_ context.Context, doc entcollect.Document) error {
-		docs = append(docs, doc)
-		return nil
-	}
-	log := slog.New(slog.NewTextHandler(newTestLogWriter(t), nil))
-
-	var err error
-	if full {
-		err = p.FullSync(ctx, store, pub, log)
-	} else {
-		err = p.IncrementalSync(ctx, store, pub, log)
-	}
-	if err != nil {
-		t.Fatalf("sync: %v", err)
-	}
-	return docs
-}
-
-// testLogWriter bridges slog to t.Log.
-type testLogWriter struct{ t *testing.T }
-
-func newTestLogWriter(t *testing.T) *testLogWriter { return &testLogWriter{t: t} }
-
-func (w *testLogWriter) Write(p []byte) (int, error) {
-	w.t.Log(string(p))
-	return len(p), nil
-}
-
-func boolPtr(b bool) *bool    { return &b }
-func strPtr(s string) *string { return &s }
 
 func TestFullSync_FirstRun(t *testing.T) {
 	managed := boolPtr(true)
@@ -389,4 +233,284 @@ func TestFullSync_MissingUDID(t *testing.T) {
 	if docs[0].ID != "bbb" {
 		t.Errorf("doc ID = %q; want %q", docs[0].ID, "bbb")
 	}
+}
+
+func BenchmarkJamfFullSync(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("entities=%d", n), func(b *testing.B) {
+			fs := &fakeServer{computers: generateComputers(n)}
+			p := newBenchProvider(b, fs)
+
+			log := slog.New(slog.NewTextHandler(&noopWriter{}, nil))
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			fs.resetRequests()
+			b.ResetTimer()
+			var lastDocs []entcollect.Document
+			for range b.N {
+				store := newMemStore()
+				lastDocs = lastDocs[:0]
+				pub := func(_ context.Context, doc entcollect.Document) error {
+					lastDocs = append(lastDocs, doc)
+					return nil
+				}
+				err := p.FullSync(ctx, store, pub, log)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(fs.requestCount())/float64(b.N), "api-calls/op")
+			if len(lastDocs) > 0 {
+				total := docFieldsBytes(lastDocs)
+				b.ReportMetric(float64(total)/float64(len(lastDocs)), "bytes/doc")
+			}
+		})
+	}
+}
+
+func BenchmarkJamfIncrementalSync(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("entities=%d", n), func(b *testing.B) {
+			fs := &fakeServer{computers: generateComputers(n)}
+			p := newBenchProvider(b, fs)
+
+			log := slog.New(slog.NewTextHandler(&noopWriter{}, nil))
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			fs.resetRequests()
+			b.ResetTimer()
+			var lastDocs []entcollect.Document
+			for range b.N {
+				store := newMemStore()
+				lastDocs = lastDocs[:0]
+				pub := func(_ context.Context, doc entcollect.Document) error {
+					lastDocs = append(lastDocs, doc)
+					return nil
+				}
+				err := p.IncrementalSync(ctx, store, pub, log)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(fs.requestCount())/float64(b.N), "api-calls/op")
+			if len(lastDocs) > 0 {
+				total := docFieldsBytes(lastDocs)
+				b.ReportMetric(float64(total)/float64(len(lastDocs)), "bytes/doc")
+			}
+		})
+	}
+}
+
+func collectDocs(ctx context.Context, t *testing.T, p *jamf.Provider, store entcollect.Store, full bool) []entcollect.Document {
+	t.Helper()
+	var docs []entcollect.Document
+	pub := func(_ context.Context, doc entcollect.Document) error {
+		docs = append(docs, doc)
+		return nil
+	}
+	log := slog.New(slog.NewTextHandler(newTestLogWriter(t), nil))
+
+	var err error
+	if full {
+		err = p.FullSync(ctx, store, pub, log)
+	} else {
+		err = p.IncrementalSync(ctx, store, pub, log)
+	}
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	return docs
+}
+
+func newTestProvider(t *testing.T, fs *fakeServer) (*jamf.Provider, *httptest.Server, string) {
+	t.Helper()
+	srv := httptest.NewTLSServer(fs.handler(t))
+	t.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+
+	cfg := jamf.DefaultConfig()
+	cfg.TenantID = u.Host
+	cfg.Username = "user"
+	cfg.Password = "pass"
+	cfg.PageSize = fs.pageSize
+
+	p := jamf.NewWithClient(cfg, srv.Client())
+	return p, srv, u.Host
+}
+
+func generateComputers(n int) []jamf.Computer {
+	managed := boolPtr(true)
+	cs := make([]jamf.Computer, n)
+	for i := range n {
+		udid := fmt.Sprintf("dev-%06d", i)
+		name := fmt.Sprintf("host-%d", i)
+		cs[i] = jamf.Computer{UDID: strPtr(udid), Name: strPtr(name), IsManaged: managed}
+	}
+	return cs
+}
+
+func newBenchProvider(b *testing.B, fs *fakeServer) *jamf.Provider {
+	b.Helper()
+	srv := httptest.NewTLSServer(fs.handler(b))
+	b.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		b.Fatalf("parse server URL: %v", err)
+	}
+
+	cfg := jamf.DefaultConfig()
+	cfg.TenantID = u.Host
+	cfg.Username = "user"
+	cfg.Password = "pass"
+	cfg.PageSize = fs.pageSize
+	return jamf.NewWithClient(cfg, srv.Client())
+}
+
+// fakeServer holds the current list of computers served by the test server and
+// the page size it simulates.
+type fakeServer struct {
+	computers []jamf.Computer
+	pageSize  int
+	requests  atomic.Int64
+}
+
+func (fs *fakeServer) resetRequests()     { fs.requests.Store(0) }
+func (fs *fakeServer) requestCount() int64 { return fs.requests.Load() }
+
+func (fs *fakeServer) handler(tb testing.TB) http.Handler {
+	tb.Helper()
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /api/v1/auth/token", func(w http.ResponseWriter, r *http.Request) {
+		fs.requests.Add(1)
+		tok := struct {
+			Token   string    `json:"token"`
+			Expires time.Time `json:"expires"`
+		}{
+			Token:   "test-token",
+			Expires: time.Now().Add(30 * time.Minute),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		err := json.NewEncoder(w).Encode(tok)
+		if err != nil {
+			tb.Errorf("encode token response: %v", err)
+		}
+	})
+
+	mux.HandleFunc("GET /api/preview/computers", func(w http.ResponseWriter, r *http.Request) {
+		fs.requests.Add(1)
+		all := fs.computers
+		total := len(all)
+
+		page := 0
+		pageSize := len(all)
+		if v := r.URL.Query().Get("page"); v != "" {
+			page, _ = strconv.Atoi(v)
+		}
+		if v := r.URL.Query().Get("page-size"); v != "" {
+			pageSize, _ = strconv.Atoi(v)
+		}
+
+		start := page * pageSize
+		end := start + pageSize
+		if start > total {
+			start = total
+		}
+		if end > total {
+			end = total
+		}
+
+		resp := struct {
+			TotalCount int             `json:"totalCount"`
+			Results    []jamf.Computer `json:"results"`
+		}{
+			TotalCount: total,
+			Results:    all[start:end],
+		}
+		w.Header().Set("Content-Type", "application/json")
+		err := json.NewEncoder(w).Encode(resp)
+		if err != nil {
+			tb.Errorf("encode computers response: %v", err)
+		}
+	})
+
+	return mux
+}
+
+// memStore is a minimal in-memory Store for testing.
+type memStore struct {
+	data map[string]json.RawMessage
+}
+
+func newMemStore() *memStore {
+	return &memStore{data: make(map[string]json.RawMessage)}
+}
+
+func (m *memStore) Get(key string, dst any) error {
+	raw, ok := m.data[key]
+	if !ok {
+		return fmt.Errorf("memstore get %q: %w", key, entcollect.ErrKeyNotFound)
+	}
+	return json.Unmarshal(raw, dst)
+}
+
+func (m *memStore) Set(key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	m.data[key] = raw
+	return nil
+}
+
+func (m *memStore) Delete(key string) error {
+	delete(m.data, key)
+	return nil
+}
+
+func (m *memStore) Each(fn func(string, func(any) error) (bool, error)) error {
+	for k, v := range m.data {
+		v := v
+		cont, err := fn(k, func(dst any) error { return json.Unmarshal(v, dst) })
+		if err != nil {
+			return err
+		}
+		if !cont {
+			return nil
+		}
+	}
+	return nil
+}
+
+// testLogWriter bridges slog to t.Log.
+type testLogWriter struct{ t *testing.T }
+
+func newTestLogWriter(t *testing.T) *testLogWriter { return &testLogWriter{t: t} }
+
+func (w testLogWriter) Write(p []byte) (int, error) {
+	w.t.Log(string(p))
+	return len(p), nil
+}
+
+type noopWriter struct{}
+
+func (noopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func boolPtr(b bool) *bool    { return &b }
+func strPtr(s string) *string { return &s }
+
+func docFieldsBytes(docs []entcollect.Document) int {
+	total := 0
+	for _, d := range docs {
+		b, _ := json.Marshal(d.Fields)
+		total += len(b)
+	}
+	return total
 }

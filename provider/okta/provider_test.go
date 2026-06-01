@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,7 +179,7 @@ func TestFullSync_Supervises(t *testing.T) {
 		},
 	}
 
-	srv := httptest.NewTLSServer(fs.handler())
+	srv := httptest.NewTLSServer(fs.handler(t))
 	t.Cleanup(srv.Close)
 
 	u, err := url.Parse(srv.URL)
@@ -222,7 +223,7 @@ func TestFullSync_DatasetUsers(t *testing.T) {
 		devices: []okta.Device{{ID: "d1", Status: "ACTIVE"}},
 	}
 
-	srv := httptest.NewTLSServer(fs.handler())
+	srv := httptest.NewTLSServer(fs.handler(t))
 	t.Cleanup(srv.Close)
 
 	u, err := url.Parse(srv.URL)
@@ -257,7 +258,7 @@ func TestFullSync_DatasetDevices(t *testing.T) {
 		devUsers: map[string][]okta.User{"d1": {{ID: "u1"}}},
 	}
 
-	srv := httptest.NewTLSServer(fs.handler())
+	srv := httptest.NewTLSServer(fs.handler(t))
 	t.Cleanup(srv.Close)
 
 	u, err := url.Parse(srv.URL)
@@ -297,7 +298,7 @@ func TestFullSync_DeviceDeletion(t *testing.T) {
 		devUsers: map[string][]okta.User{},
 	}
 
-	srv := httptest.NewTLSServer(fs.handler())
+	srv := httptest.NewTLSServer(fs.handler(t))
 	t.Cleanup(srv.Close)
 
 	u, err := url.Parse(srv.URL)
@@ -615,19 +616,30 @@ type fakeOktaServer struct {
 	members  map[string][]string // group ID → user IDs
 	devices  []okta.Device
 	devUsers map[string][]okta.User // device ID → users
+	requests atomic.Int64
 }
 
-func (fs *fakeOktaServer) handler() http.Handler {
+func (fs *fakeOktaServer) resetRequests()     { fs.requests.Store(0) }
+func (fs *fakeOktaServer) requestCount() int64 { return fs.requests.Load() }
+
+func (fs *fakeOktaServer) handler(tb testing.TB) http.Handler {
+	tb.Helper()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1/users", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(fs.users) //nolint:errcheck
+		err := json.NewEncoder(w).Encode(fs.users)
+		if err != nil {
+			tb.Errorf("encode users: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/groups", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(fs.groups) //nolint:errcheck
+		err := json.NewEncoder(w).Encode(fs.groups)
+		if err != nil {
+			tb.Errorf("encode groups: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/groups/{groupId}/users", func(w http.ResponseWriter, r *http.Request) {
@@ -643,7 +655,10 @@ func (fs *fakeOktaServer) handler() http.Handler {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result) //nolint:errcheck
+		err := json.NewEncoder(w).Encode(result)
+		if err != nil {
+			tb.Errorf("encode group members: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/users/{userId}/groups", func(w http.ResponseWriter, r *http.Request) {
@@ -658,12 +673,18 @@ func (fs *fakeOktaServer) handler() http.Handler {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result) //nolint:errcheck
+		err := json.NewEncoder(w).Encode(result)
+		if err != nil {
+			tb.Errorf("encode user groups: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/devices", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(fs.devices) //nolint:errcheck
+		err := json.NewEncoder(w).Encode(fs.devices)
+		if err != nil {
+			tb.Errorf("encode devices: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/devices/{deviceId}/users", func(w http.ResponseWriter, r *http.Request) {
@@ -677,30 +698,45 @@ func (fs *fakeOktaServer) handler() http.Handler {
 			result = append(result, wrapped{User: u})
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result) //nolint:errcheck
+		err := json.NewEncoder(w).Encode(result)
+		if err != nil {
+			tb.Errorf("encode device users: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/users/{userId}/factors", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]okta.Factor{}) //nolint:errcheck
+		err := json.NewEncoder(w).Encode([]okta.Factor{})
+		if err != nil {
+			tb.Errorf("encode factors: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/users/{userId}/roles", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]okta.Role{}) //nolint:errcheck
+		err := json.NewEncoder(w).Encode([]okta.Role{})
+		if err != nil {
+			tb.Errorf("encode roles: %v", err)
+		}
 	})
 
 	mux.HandleFunc("GET /api/v1/users/{userId}/devices", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]okta.Device{}) //nolint:errcheck
+		err := json.NewEncoder(w).Encode([]okta.Device{})
+		if err != nil {
+			tb.Errorf("encode user devices: %v", err)
+		}
 	})
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fs.requests.Add(1)
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func newTestProvider(t *testing.T, fs *fakeOktaServer) (*okta.Provider, *httptest.Server) {
 	t.Helper()
-	srv := httptest.NewTLSServer(fs.handler())
+	srv := httptest.NewTLSServer(fs.handler(t))
 	t.Cleanup(srv.Close)
 
 	u, err := url.Parse(srv.URL)
@@ -741,7 +777,7 @@ type testLogWriter struct{ t *testing.T }
 
 func newTestLogWriter(t *testing.T) *testLogWriter { return &testLogWriter{t: t} }
 
-func (w *testLogWriter) Write(p []byte) (int, error) {
+func (w testLogWriter) Write(p []byte) (int, error) {
 	w.t.Log(string(p))
 	return len(p), nil
 }
@@ -766,4 +802,165 @@ func filterByAction(docs []entcollect.Document, action entcollect.Action) []entc
 		}
 	}
 	return result
+}
+
+func BenchmarkOktaFullSync(b *testing.B) {
+	for _, tc := range []struct {
+		users  int
+		groups int
+	}{
+		{10, 1},
+		{100, 10},
+		{1000, 10},
+		{1000, 50},
+	} {
+		name := fmt.Sprintf("users=%d/groups=%d", tc.users, tc.groups)
+		b.Run(name, func(b *testing.B) {
+			groups, members := generateOktaGroups(tc.groups, tc.users)
+			fs := &fakeOktaServer{
+				users:   generateOktaUsers(tc.users),
+				groups:  groups,
+				members: members,
+			}
+			p := newBenchOktaProvider(b, fs)
+
+			log := slog.New(slog.NewTextHandler(&noopWriter{}, nil))
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			fs.resetRequests()
+			b.ResetTimer()
+			var lastDocs []entcollect.Document
+			for range b.N {
+				store := newMemStore()
+				lastDocs = lastDocs[:0]
+				pub := func(_ context.Context, doc entcollect.Document) error {
+					lastDocs = append(lastDocs, doc)
+					return nil
+				}
+				err := p.FullSync(ctx, store, pub, log)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(fs.requestCount())/float64(b.N), "api-calls/op")
+			if len(lastDocs) > 0 {
+				total := docFieldsBytes(lastDocs)
+				b.ReportMetric(float64(total)/float64(len(lastDocs)), "bytes/doc")
+			}
+		})
+	}
+}
+
+func BenchmarkOktaIncrementalSync(b *testing.B) {
+	for _, tc := range []struct {
+		users  int
+		groups int
+	}{
+		{10, 1},
+		{100, 10},
+		{1000, 10},
+		{1000, 50},
+	} {
+		name := fmt.Sprintf("users=%d/groups=%d", tc.users, tc.groups)
+		b.Run(name, func(b *testing.B) {
+			groups, members := generateOktaGroups(tc.groups, tc.users)
+			fs := &fakeOktaServer{
+				users:   generateOktaUsers(tc.users),
+				groups:  groups,
+				members: members,
+			}
+			p := newBenchOktaProvider(b, fs)
+
+			log := slog.New(slog.NewTextHandler(&noopWriter{}, nil))
+			ctx := context.Background()
+
+			// Establish initial state.
+			store := newMemStore()
+			var docs []entcollect.Document
+			pub := func(_ context.Context, doc entcollect.Document) error {
+				docs = append(docs, doc)
+				return nil
+			}
+			err := p.FullSync(ctx, store, pub, log)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			fs.resetRequests()
+			b.ResetTimer()
+			for range b.N {
+				docs = docs[:0]
+				err = p.IncrementalSync(ctx, store, pub, log)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(fs.requestCount())/float64(b.N), "api-calls/op")
+		})
+	}
+}
+
+func generateOktaUsers(n int) []okta.User {
+	now := time.Now()
+	users := make([]okta.User, n)
+	for i := range n {
+		users[i] = okta.User{
+			ID:          fmt.Sprintf("u%d", i),
+			Status:      "ACTIVE",
+			LastUpdated: now,
+			Profile:     map[string]any{"login": fmt.Sprintf("user%d@example.com", i)},
+		}
+	}
+	return users
+}
+
+// generateOktaGroups creates nGroups groups and distributes nUsers user IDs
+// across them round-robin so each group gets roughly nUsers/nGroups members.
+func generateOktaGroups(nGroups, nUsers int) ([]okta.Group, map[string][]string) {
+	groups := make([]okta.Group, nGroups)
+	members := make(map[string][]string, nGroups)
+	for i := range nGroups {
+		gid := fmt.Sprintf("g%d", i)
+		groups[i] = okta.Group{ID: gid, Profile: map[string]any{"name": fmt.Sprintf("Group %d", i)}}
+		ms := make([]string, 0, nUsers/nGroups+1)
+		for j := range nUsers {
+			if j%nGroups == i {
+				ms = append(ms, fmt.Sprintf("u%d", j))
+			}
+		}
+		members[gid] = ms
+	}
+	return groups, members
+}
+
+func newBenchOktaProvider(b *testing.B, fs *fakeOktaServer) *okta.Provider {
+	b.Helper()
+	srv := httptest.NewTLSServer(fs.handler(b))
+	b.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		b.Fatalf("parse server URL: %v", err)
+	}
+
+	cfg := okta.DefaultConfig()
+	cfg.Domain = u.Host
+	cfg.Token = "test-token"
+	cfg.LimitFixed = intPtr(100000)
+	return okta.NewWithClient(cfg, srv.Client())
+}
+
+type noopWriter struct{}
+
+func (noopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func docFieldsBytes(docs []entcollect.Document) int {
+	total := 0
+	for _, d := range docs {
+		b, _ := json.Marshal(d.Fields)
+		total += len(b)
+	}
+	return total
 }
