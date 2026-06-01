@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -597,20 +598,31 @@ func filterByKind(docs []entcollect.Document, kind entcollect.EntityKind) []entc
 	return out
 }
 
+// startTestLDAPServer is the common-case wrapper for startLDAPServer that
+// discards the testLDAPServer handle. Benchmarks that need to count LDAP
+// searches use startLDAPServer directly.
 func startTestLDAPServer(t *testing.T, fix *ldapFixture) string {
-	t.Helper()
+	_, url := startLDAPServer(t, fix)
+	return url
+}
+
+// startLDAPServer starts a gldap server on a free port using the provided
+// fixture data. It returns the server handle (for search counting) and the
+// ldap:// URL to connect to.
+func startLDAPServer(tb testing.TB, fix *ldapFixture) (*testLDAPServer, string) {
+	tb.Helper()
 
 	ts := &testLDAPServer{fix: fix}
 
 	s, err := gldap.NewServer()
 	if err != nil {
-		t.Fatalf("gldap new server: %v", err)
+		tb.Fatalf("gldap new server: %v", err)
 	}
-	t.Cleanup(func() { s.Stop() })
+	tb.Cleanup(func() { _ = s.Stop() })
 
 	mux, err := gldap.NewMux()
 	if err != nil {
-		t.Fatalf("gldap new mux: %v", err)
+		tb.Fatalf("gldap new mux: %v", err)
 	}
 
 	err = mux.Bind(func(w *gldap.ResponseWriter, r *gldap.Request) {
@@ -619,30 +631,32 @@ func startTestLDAPServer(t *testing.T, fix *ldapFixture) string {
 		_ = w.Write(resp)
 	})
 	if err != nil {
-		t.Fatalf("mux bind: %v", err)
+		tb.Fatalf("mux bind: %v", err)
 	}
 
-	err = mux.Search(ts.searchHandler(t))
+	err = mux.Search(ts.searchHandler(tb))
 	if err != nil {
-		t.Fatalf("mux search: %v", err)
+		tb.Fatalf("mux search: %v", err)
 	}
 
 	err = mux.Unbind(func(w *gldap.ResponseWriter, r *gldap.Request) {})
 	if err != nil {
-		t.Fatalf("mux unbind: %v", err)
+		tb.Fatalf("mux unbind: %v", err)
 	}
 
-	if err := s.Router(mux); err != nil {
-		t.Fatalf("gldap router: %v", err)
+	err = s.Router(mux)
+	if err != nil {
+		tb.Fatalf("gldap router: %v", err)
 	}
 
 	// Find a free port.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(tb.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("listen: %v", err)
+		tb.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	go func() {
 		_ = s.Run(addr)
@@ -655,10 +669,10 @@ func startTestLDAPServer(t *testing.T, fix *ldapFixture) string {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !s.Ready() {
-		t.Fatal("gldap server not ready")
+		tb.Fatal("gldap server not ready")
 	}
 
-	return "ldap://" + addr
+	return ts, "ldap://" + addr
 }
 
 func appendUnique(entries []ldapEntry, e ldapEntry) []ldapEntry {
@@ -673,8 +687,12 @@ func appendUnique(entries []ldapEntry, e ldapEntry) []ldapEntry {
 // testLDAPServer holds a running gldap server and its fixture data. The
 // fixture is a pointer so tests can mutate it between sync calls.
 type testLDAPServer struct {
-	fix *ldapFixture
+	fix      *ldapFixture
+	searches atomic.Int64
 }
+
+func (s *testLDAPServer) resetSearches()     { s.searches.Store(0) }
+func (s *testLDAPServer) searchCount() int64 { return s.searches.Load() }
 
 // ldapFixture describes the entries the test LDAP server should return.
 type ldapFixture struct {
@@ -688,9 +706,11 @@ type ldapEntry struct {
 	attrs map[string][]string
 }
 
-func (s *testLDAPServer) searchHandler(t *testing.T) gldap.HandlerFunc {
+func (s *testLDAPServer) searchHandler(t testing.TB) gldap.HandlerFunc {
 	t.Helper()
 	return func(w *gldap.ResponseWriter, r *gldap.Request) {
+		s.searches.Add(1)
+
 		msg, err := r.GetSearchMessage()
 		if err != nil {
 			t.Errorf("get search message: %v", err)
@@ -778,7 +798,127 @@ func (m *memStore) Each(fn func(string, func(any) error) (bool, error)) error {
 
 type testLogWriter struct{ t *testing.T }
 
-func (w *testLogWriter) Write(p []byte) (int, error) {
+func (w testLogWriter) Write(p []byte) (int, error) {
 	w.t.Log(string(p))
 	return len(p), nil
+}
+
+func BenchmarkADFullSync(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("entities=%d", n), func(b *testing.B) {
+			fix := &ldapFixture{
+				users:   generateLDAPEntries(n, "user"),
+				devices: generateLDAPEntries(n/2, "host"),
+			}
+			ts, url := startLDAPServer(b, fix)
+			p := newBenchProvider(b, url)
+
+			log := slog.New(slog.NewTextHandler(&noopWriter{}, nil))
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			ts.resetSearches()
+			b.ResetTimer()
+			var lastDocs []entcollect.Document
+			for range b.N {
+				store := newMemStore()
+				lastDocs = lastDocs[:0]
+				pub := func(_ context.Context, doc entcollect.Document) error {
+					lastDocs = append(lastDocs, doc)
+					return nil
+				}
+				err := p.FullSync(ctx, store, pub, log)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(ts.searchCount())/float64(b.N), "ldap-searches/op")
+			if len(lastDocs) > 0 {
+				total := docFieldsBytes(lastDocs)
+				b.ReportMetric(float64(total)/float64(len(lastDocs)), "bytes/doc")
+			}
+		})
+	}
+}
+
+func BenchmarkADIncrementalSync(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("entities=%d", n), func(b *testing.B) {
+			fix := &ldapFixture{
+				users:   generateLDAPEntries(n, "user"),
+				devices: generateLDAPEntries(n/2, "host"),
+			}
+			ts, url := startLDAPServer(b, fix)
+			p := newBenchProvider(b, url)
+
+			log := slog.New(slog.NewTextHandler(&noopWriter{}, nil))
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			ts.resetSearches()
+			b.ResetTimer()
+			var lastDocs []entcollect.Document
+			for range b.N {
+				store := newMemStore()
+				lastDocs = lastDocs[:0]
+				pub := func(_ context.Context, doc entcollect.Document) error {
+					lastDocs = append(lastDocs, doc)
+					return nil
+				}
+				err := p.IncrementalSync(ctx, store, pub, log)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(ts.searchCount())/float64(b.N), "ldap-searches/op")
+			if len(lastDocs) > 0 {
+				total := docFieldsBytes(lastDocs)
+				b.ReportMetric(float64(total)/float64(len(lastDocs)), "bytes/doc")
+			}
+		})
+	}
+}
+
+func generateLDAPEntries(n int, kind string) []ldapEntry {
+	entries := make([]ldapEntry, n)
+	for i := range n {
+		cn := fmt.Sprintf("%s-%06d", kind, i)
+		dn := fmt.Sprintf("cn=%s,dc=example,dc=com", cn)
+		entries[i] = ldapEntry{
+			dn: dn,
+			attrs: map[string][]string{
+				"cn":                {cn},
+				"distinguishedName": {dn},
+				"whenChanged":       {"20260101120000.0Z"},
+			},
+		}
+	}
+	return entries
+}
+
+func newBenchProvider(b *testing.B, url string) *ad.Provider {
+	b.Helper()
+	cfg := ad.DefaultConfig()
+	cfg.URL = url
+	cfg.BaseDN = "DC=example,DC=com"
+	cfg.User = "cn=admin,dc=example,dc=com"
+	cfg.Password = "pass"
+	p, err := ad.New(cfg)
+	if err != nil {
+		b.Fatalf("ad.New: %v", err)
+	}
+	return p
+}
+
+type noopWriter struct{}
+
+func (noopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func docFieldsBytes(docs []entcollect.Document) int {
+	total := 0
+	for _, d := range docs {
+		b, _ := json.Marshal(d.Fields)
+		total += len(b)
+	}
+	return total
 }
