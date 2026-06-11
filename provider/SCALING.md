@@ -4,7 +4,7 @@ Scaling characteristics of the entity analytics providers, focused on
 EntraID's group-graph topology since that is the most complex sync path.
 The final section compares API cost across all four providers.
 
-Session 6c benchmark results. Reproduce with:
+Benchmark results. Reproduce with:
 
 ```
 go test -run ^$ -bench 'BenchmarkEntraid|BenchmarkMembershipGraph' -benchtime 1s ./provider/entraid/
@@ -94,7 +94,8 @@ recomputes BFS independently. At 10k groups, per-user expand takes 748µs
 — not a bottleneck relative to the API call cost (~50ms+ per call in
 production). Memoization would help if graph CPU became dominant, but at
 realistic API latencies, group fetch API calls are 100× more expensive
-than graph operations. Documented for Session 7; no optimisation needed.
+than graph operations. Documented for preparation for [elastic/beats#51210](https://github.com/elastic/beats/pull/51210);
+no optimisation needed.
 
 ### Rate-limit profile
 
