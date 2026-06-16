@@ -12,7 +12,7 @@ import (
 )
 
 func TestMembershipGraph_DirectOnly(t *testing.T) {
-	mg := newMembershipGraph()
+	mg := newMapBackend()
 	mg.addGroup(Group{ID: "g1", DisplayName: "Group 1"})
 	mg.addGroup(Group{ID: "g2", DisplayName: "Group 2"})
 	mg.addMembers("g1", []Member{
@@ -23,20 +23,26 @@ func TestMembershipGraph_DirectOnly(t *testing.T) {
 		{ID: "u2", Type: odataTypeUser},
 	})
 
-	gs := mg.userTransitiveGroups("u1")
+	gs, err := userTransitiveGroups(mg, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sortGroups(gs)
 	if len(gs) != 2 || gs[0].ID != "g1" || gs[1].ID != "g2" {
 		t.Errorf("u1 groups = %v; want [g1, g2]", groupIDs(gs))
 	}
 
-	gs = mg.userTransitiveGroups("u2")
+	gs, err = userTransitiveGroups(mg, "u2")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(gs) != 1 || gs[0].ID != "g2" {
 		t.Errorf("u2 groups = %v; want [g2]", groupIDs(gs))
 	}
 }
 
 func TestMembershipGraph_TwoLevelNesting(t *testing.T) {
-	mg := newMembershipGraph()
+	mg := newMapBackend()
 	mg.addGroup(Group{ID: "child", DisplayName: "Child"})
 	mg.addGroup(Group{ID: "parent", DisplayName: "Parent"})
 
@@ -47,7 +53,10 @@ func TestMembershipGraph_TwoLevelNesting(t *testing.T) {
 		{ID: "child", Type: odataTypeGroup},
 	})
 
-	gs := mg.userTransitiveGroups("u1")
+	gs, err := userTransitiveGroups(mg, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sortGroups(gs)
 	if len(gs) != 2 || gs[0].ID != "child" || gs[1].ID != "parent" {
 		t.Errorf("u1 groups = %v; want [child, parent]", groupIDs(gs))
@@ -55,7 +64,7 @@ func TestMembershipGraph_TwoLevelNesting(t *testing.T) {
 }
 
 func TestMembershipGraph_DeepNesting(t *testing.T) {
-	mg := newMembershipGraph()
+	mg := newMapBackend()
 	mg.addGroup(Group{ID: "a", DisplayName: "A"})
 	mg.addGroup(Group{ID: "b", DisplayName: "B"})
 	mg.addGroup(Group{ID: "c", DisplayName: "C"})
@@ -66,7 +75,10 @@ func TestMembershipGraph_DeepNesting(t *testing.T) {
 	mg.addMembers("c", []Member{{ID: "b", Type: odataTypeGroup}})
 	mg.addMembers("d", []Member{{ID: "c", Type: odataTypeGroup}})
 
-	gs := mg.userTransitiveGroups("u1")
+	gs, err := userTransitiveGroups(mg, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sortGroups(gs)
 	ids := groupIDs(gs)
 	want := []string{"a", "b", "c", "d"}
@@ -81,7 +93,7 @@ func TestMembershipGraph_DeepNesting(t *testing.T) {
 }
 
 func TestMembershipGraph_CycleDetection(t *testing.T) {
-	mg := newMembershipGraph()
+	mg := newMapBackend()
 	mg.addGroup(Group{ID: "a", DisplayName: "A"})
 	mg.addGroup(Group{ID: "b", DisplayName: "B"})
 
@@ -93,7 +105,10 @@ func TestMembershipGraph_CycleDetection(t *testing.T) {
 		{ID: "a", Type: odataTypeGroup},
 	})
 
-	gs := mg.userTransitiveGroups("u1")
+	gs, err := userTransitiveGroups(mg, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sortGroups(gs)
 	if len(gs) != 2 || gs[0].ID != "a" || gs[1].ID != "b" {
 		t.Errorf("u1 groups = %v; want [a, b] (cycle should not loop)", groupIDs(gs))
@@ -101,7 +116,7 @@ func TestMembershipGraph_CycleDetection(t *testing.T) {
 }
 
 func TestMembershipGraph_SharedParent(t *testing.T) {
-	mg := newMembershipGraph()
+	mg := newMapBackend()
 	mg.addGroup(Group{ID: "x", DisplayName: "X"})
 	mg.addGroup(Group{ID: "y", DisplayName: "Y"})
 	mg.addGroup(Group{ID: "top", DisplayName: "Top"})
@@ -113,7 +128,10 @@ func TestMembershipGraph_SharedParent(t *testing.T) {
 		{ID: "y", Type: odataTypeGroup},
 	})
 
-	gs := mg.userTransitiveGroups("u1")
+	gs, err := userTransitiveGroups(mg, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sortGroups(gs)
 	if len(gs) != 3 {
 		t.Fatalf("u1 groups = %v; want [top, x, y]", groupIDs(gs))
@@ -124,14 +142,17 @@ func TestMembershipGraph_SharedParent(t *testing.T) {
 }
 
 func TestMembershipGraph_DeviceMembership(t *testing.T) {
-	mg := newMembershipGraph()
+	mg := newMapBackend()
 	mg.addGroup(Group{ID: "g1", DisplayName: "G1"})
 	mg.addGroup(Group{ID: "g2", DisplayName: "G2"})
 
 	mg.addMembers("g1", []Member{{ID: "d1", Type: odataTypeDevice}})
 	mg.addMembers("g2", []Member{{ID: "g1", Type: odataTypeGroup}})
 
-	gs := mg.deviceTransitiveGroups("d1")
+	gs, err := deviceTransitiveGroups(mg, "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sortGroups(gs)
 	if len(gs) != 2 || gs[0].ID != "g1" || gs[1].ID != "g2" {
 		t.Errorf("d1 groups = %v; want [g1, g2]", groupIDs(gs))
@@ -139,26 +160,35 @@ func TestMembershipGraph_DeviceMembership(t *testing.T) {
 }
 
 func TestMembershipGraph_RemovedMembersSkipped(t *testing.T) {
-	mg := newMembershipGraph()
+	mg := newMapBackend()
 	mg.addGroup(Group{ID: "g1", DisplayName: "G1"})
 	mg.addMembers("g1", []Member{
 		{ID: "u1", Type: odataTypeUser},
 		{ID: "u2", Type: odataTypeUser, Removed: &removed{Reason: "deleted"}},
 	})
 
-	gs := mg.userTransitiveGroups("u1")
+	gs, err := userTransitiveGroups(mg, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(gs) != 1 || gs[0].ID != "g1" {
 		t.Errorf("u1 groups = %v; want [g1]", groupIDs(gs))
 	}
-	gs = mg.userTransitiveGroups("u2")
+	gs, err = userTransitiveGroups(mg, "u2")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(gs) != 0 {
 		t.Errorf("removed member u2 groups = %v; want []", groupIDs(gs))
 	}
 }
 
 func TestMembershipGraph_NoGroups(t *testing.T) {
-	mg := newMembershipGraph()
-	gs := mg.userTransitiveGroups("u1")
+	mg := newMapBackend()
+	gs, err := userTransitiveGroups(mg, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if gs != nil {
 		t.Errorf("unknown user groups = %v; want nil", gs)
 	}
@@ -198,7 +228,7 @@ func BenchmarkMembershipGraph_Build(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				buildGraph(gg)
+				buildTestGraph(gg)
 			}
 		})
 	}
@@ -220,12 +250,12 @@ func BenchmarkMembershipGraph_UserTransitiveGroups(b *testing.B) {
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			gg := tc.gen()
-			mg := buildGraph(gg)
+			mg := buildTestGraph(gg)
 			uid := gg.userIDs[0]
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				mg.userTransitiveGroups(uid)
+				userTransitiveGroups(mg, uid)
 			}
 		})
 	}
@@ -245,12 +275,12 @@ func BenchmarkMembershipGraph_AllUsers(b *testing.B) {
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			gg := tc.gen()
-			mg := buildGraph(gg)
+			mg := buildTestGraph(gg)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
 				for _, uid := range gg.userIDs {
-					mg.userTransitiveGroups(uid)
+					userTransitiveGroups(mg, uid)
 				}
 			}
 		})
@@ -391,9 +421,9 @@ func generateDiamondGroups(nLeaves, nParents, nUsers int) generatedGraph {
 	return generatedGraph{groups: groups, members: members, userIDs: userIDs}
 }
 
-// buildGraph populates a membershipGraph from a generatedGraph fixture.
-func buildGraph(gg generatedGraph) *membershipGraph {
-	mg := newMembershipGraph()
+// buildTestGraph populates a mapBackend from a generatedGraph fixture.
+func buildTestGraph(gg generatedGraph) *mapBackend {
+	mg := newMapBackend()
 	for _, g := range gg.groups {
 		mg.addGroup(g)
 	}

@@ -10,7 +10,7 @@
 // @removed, so no idset is needed. Persistent state is two delta URL strings
 // (one for users, one for devices).
 //
-// Transitive group membership is computed from an in-memory graph built
+// Transitive group membership is computed from a scratch-backed graph built
 // fresh each sync by listing all groups and their members. This avoids
 // storing group relationships between syncs but means every active sync
 // (one where at least one user or device changed) incurs O(groups + members)
@@ -97,10 +97,11 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		log.Info("fetched devices", "count", len(devices))
 	}
 
-	mg, err := p.buildMembershipGraph(ctx, gc)
+	mg, err := p.buildGraph(ctx, gc)
 	if err != nil {
 		return fmt.Errorf("entraid: build membership graph: %w", err)
 	}
+	defer mg.close()
 
 	var mfa map[string]*MFADetails
 	if p.cfg.wantMFA() && len(users) > 0 {
@@ -124,7 +125,9 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 			"azure_ad": u.Fields,
 			"user.id":  u.id,
 		}
-		if groups := mg.userTransitiveGroups(u.id); len(groups) > 0 {
+		if groups, err := userTransitiveGroups(mg, u.id); err != nil {
+			return fmt.Errorf("entraid: transitive groups for user %s: %w", u.id, err)
+		} else if len(groups) > 0 {
 			fields["user.group"] = groups
 		}
 		if mfa != nil {
@@ -155,7 +158,9 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 			"azure_ad":  d.Fields,
 			"device.id": d.id,
 		}
-		if groups := mg.deviceTransitiveGroups(d.id); len(groups) > 0 {
+		if groups, err := deviceTransitiveGroups(mg, d.id); err != nil {
+			return fmt.Errorf("entraid: transitive groups for device %s: %w", d.id, err)
+		} else if len(groups) > 0 {
 			fields["device.group"] = groups
 		}
 		if err := p.enrichDeviceOwnership(ctx, gc, d.id, fields); err != nil {
@@ -248,10 +253,11 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 		return nil
 	}
 
-	mg, err := p.buildMembershipGraph(ctx, gc)
+	mg, err := p.buildGraph(ctx, gc)
 	if err != nil {
 		return fmt.Errorf("entraid: build membership graph: %w", err)
 	}
+	defer mg.close()
 
 	var mfa map[string]*MFADetails
 	if p.cfg.wantMFA() && len(users) > 0 {
@@ -275,7 +281,9 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 			"azure_ad": u.Fields,
 			"user.id":  u.id,
 		}
-		if groups := mg.userTransitiveGroups(u.id); len(groups) > 0 {
+		if groups, err := userTransitiveGroups(mg, u.id); err != nil {
+			return fmt.Errorf("entraid: transitive groups for user %s: %w", u.id, err)
+		} else if len(groups) > 0 {
 			fields["user.group"] = groups
 		}
 		if mfa != nil {
@@ -306,7 +314,9 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 			"azure_ad":  d.Fields,
 			"device.id": d.id,
 		}
-		if groups := mg.deviceTransitiveGroups(d.id); len(groups) > 0 {
+		if groups, err := deviceTransitiveGroups(mg, d.id); err != nil {
+			return fmt.Errorf("entraid: transitive groups for device %s: %w", d.id, err)
+		} else if len(groups) > 0 {
 			fields["device.group"] = groups
 		}
 		if err := p.enrichDeviceOwnership(ctx, gc, d.id, fields); err != nil {
@@ -347,20 +357,31 @@ func (p *Provider) newGraphClient(log *slog.Logger) *graphClient {
 	}
 }
 
-func (p *Provider) buildMembershipGraph(ctx context.Context, gc *graphClient) (*membershipGraph, error) {
+func (p *Provider) buildGraph(ctx context.Context, gc *graphClient) (membershipGraph, error) {
 	groups, err := gc.getGroups(ctx, p.cfg.SelectGroups)
 	if err != nil {
 		return nil, err
 	}
 
-	mg := newMembershipGraph()
+	mg, err := newScratchBackend(p.cfg.ScratchDir)
+	if err != nil {
+		return nil, fmt.Errorf("open scratch storage: %w", err)
+	}
+
 	for _, g := range groups {
-		mg.addGroup(g)
+		if err := mg.addGroup(g); err != nil {
+			mg.close()
+			return nil, fmt.Errorf("add group %s: %w", g.ID, err)
+		}
 		members, err := gc.getGroupMembers(ctx, g.ID)
 		if err != nil {
+			mg.close()
 			return nil, fmt.Errorf("members for group %s: %w", g.ID, err)
 		}
-		mg.addMembers(g.ID, members)
+		if err := mg.addMembers(g.ID, members); err != nil {
+			mg.close()
+			return nil, fmt.Errorf("add members for group %s: %w", g.ID, err)
+		}
 	}
 	return mg, nil
 }

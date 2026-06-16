@@ -35,6 +35,10 @@ type Config struct {
 
 	SyncInterval   time.Duration `json:"sync_interval"`
 	UpdateInterval time.Duration `json:"update_interval"`
+
+	// ScratchDir is the directory for temporary scratch files used during
+	// enrichment computation. Defaults to os.TempDir() when empty.
+	ScratchDir string `json:"scratch_dir"`
 }
 
 const (
