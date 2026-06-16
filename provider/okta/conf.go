@@ -39,6 +39,10 @@ type Config struct {
 
 	LimitWindow time.Duration `json:"limit_window"`
 	LimitFixed  *int          `json:"limit_fixed"`
+
+	// ScratchDir is the directory for temporary scratch files used during
+	// enrichment computation. Defaults to os.TempDir() when empty.
+	ScratchDir string `json:"scratch_dir"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.

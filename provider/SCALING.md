@@ -97,6 +97,46 @@ realistic API latencies, group fetch API calls are 100× more expensive
 than graph operations. Documented for preparation for [elastic/beats#51210](https://github.com/elastic/beats/pull/51210);
 no optimisation needed.
 
+### File-backed scratch storage
+
+The membership graph is stored in a temporary bbolt file rather than
+in-memory maps. This bounds Go heap usage for large directories — the
+heap holds only the BFS queue and seen set (proportional to nesting
+depth), not the full adjacency data.
+
+Dense topology benchmark (5k groups × 500 members = 2.5M edges, flat):
+
+| Backend | Heap delta | RSS | Scratch file | Build + 100 reads |
+|---------|-----------|-----|-------------|-------------------|
+| bbolt (scratchBackend) | ~133 MB | ~582 MB | ~277 MB | ~11 s |
+| in-memory (mapBackend) | ~114 MB | ~291 MB | — | ~0.35 s |
+
+Key observations:
+
+- **Heap delta** is comparable because bbolt allocations during bulk
+  writes are temporary. After the write phase completes, only the
+  mmap'd file and BFS working set remain — Go's garbage collector
+  can reclaim write-phase allocations.
+- **RSS** is higher with bbolt because the mmap'd file counts towards
+  RSS. However, mmap'd pages are OS-reclaimable under memory pressure
+  — unlike Go heap objects, they don't contribute to OOM kills in
+  cgroup-limited containers.
+- **Wall time** for the build phase is dominated by bbolt I/O. In
+  production this is negligible relative to the API call latency
+  (5000 group-member fetches × 50–100ms/call = 250–500s).
+- **Scratch file size** of ~277 MB for 2.5M edges is within typical
+  ephemeral disk limits for agentless containers.
+
+Reproduce with:
+
+```
+go test -run ^$ -bench BenchmarkDenseTopology -benchtime 1x ./provider/entraid/
+```
+
+Configuration: `scratch_dir` in the provider config overrides the
+default `os.TempDir()`. Files use the prefix `entcollect-scratch-*`
+for identification and crash-cleanup.
+
 ### Rate-limit profile
 
 Synthetic throttle policy: 429 + Retry-After: 1s every 50 requests.

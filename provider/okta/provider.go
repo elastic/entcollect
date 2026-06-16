@@ -83,12 +83,13 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 			return err
 		}
 
-		var groupMapping map[string][]Group
+		var gs *groupStore
 		if enrich["groups"] {
-			groupMapping, err = p.bulkFetchGroupMapping(ctx, cli, key, lim, log)
+			gs, err = p.bulkFetchGroupMapping(ctx, cli, key, lim, log)
 			if err != nil {
 				return err
 			}
+			defer gs.Close()
 		}
 
 		var supervisesMapping map[string][]SupervisedUser
@@ -109,8 +110,12 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 				"okta":    u,
 				"user.id": u.ID,
 			}
-			if groupMapping != nil {
-				fields["groups"] = groupMapping[u.ID]
+			if gs != nil {
+				if groups, err := gs.groups(u.ID); err != nil {
+					return fmt.Errorf("okta: lookup groups for user %s: %w", u.ID, err)
+				} else if len(groups) > 0 {
+					fields["groups"] = groups
+				}
 			}
 			if supervisesMapping != nil {
 				if subs := supervisesMapping[u.ID]; subs != nil {
@@ -423,27 +428,33 @@ func (p *Provider) paginateUsers(ctx context.Context, cli *http.Client, key stri
 	return all, latest, nil
 }
 
-// bulkFetchGroupMapping fetches all groups and their members, returning
-// a map from user ID to the groups that user belongs to. This is O(groups)
-// rather than O(users).
-func (p *Provider) bulkFetchGroupMapping(ctx context.Context, cli *http.Client, key string, lim *RateLimiter, log *slog.Logger) (map[string][]Group, error) {
+// bulkFetchGroupMapping fetches all groups and their members, writing
+// edges into a scratch database. Returns a groupStore handle for per-user
+// group lookup. The caller must call Close on the returned handle.
+func (p *Provider) bulkFetchGroupMapping(ctx context.Context, cli *http.Client, key string, lim *RateLimiter, log *slog.Logger) (*groupStore, error) {
 	allGroups, err := p.paginateGroups(ctx, cli, key, lim, log)
 	if err != nil {
 		return nil, err
 	}
 
-	mapping := make(map[string][]Group)
+	gs, err := newGroupStore(p.cfg.ScratchDir)
+	if err != nil {
+		return nil, fmt.Errorf("okta: open scratch for groups: %w", err)
+	}
+
 	for _, g := range allGroups {
 		members, err := p.paginateGroupMembers(ctx, cli, key, g.ID, lim, log)
 		if err != nil {
+			gs.Close()
 			return nil, err
 		}
-		for _, m := range members {
-			mapping[m.ID] = append(mapping[m.ID], g)
+		if err := gs.addGroupMembers(g, members); err != nil {
+			gs.Close()
+			return nil, fmt.Errorf("okta: write group %s members: %w", g.ID, err)
 		}
 	}
-	log.Info("built bulk group mapping", "groups", len(allGroups), "user_mappings", len(mapping))
-	return mapping, nil
+	log.Info("built bulk group mapping", "groups", len(allGroups))
+	return gs, nil
 }
 
 func (p *Provider) paginateGroups(ctx context.Context, cli *http.Client, key string, lim *RateLimiter, log *slog.Logger) ([]Group, error) {
