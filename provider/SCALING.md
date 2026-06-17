@@ -37,14 +37,14 @@ numbers.
 
 | Groups | Users | Nesting | Sync path | API calls | Graph build (ms) | Per-user expand (µs) | All-users expand (ms) | Mock sync (ms) | CI/manual |
 |--------|-------|---------|-----------|-----------|------------------|----------------------|-----------------------|----------------|-----------|
-| 10 | 1000 | flat | incremental Δ=1 | 13 | 0.07 | 5.9 | 64 | 2 | CI |
-| 100 | 1000 | flat | incremental Δ=1 | 103 | 1.1 | 5.9 | 64 | 7 | CI |
-| 1000 | 1000 | flat | incremental Δ=1 | 1003 | 9.2 | 68 | 890 | 54 | CI |
-| 1000 | 1000 | flat | full sync | 1003 | 9.2 | 68 | 890 | 51 | CI |
-| 10000 | 1000 | flat | incremental Δ=1 | 10003 | 97 | 748 | 7624 | 448 | CI |
-| 10000 | 1000 | flat | full sync | 10004 | 97 | 748 | 7624 | 534 | CI |
-| 10 | 100 | flat | full sync (throttled) | 13 | — | — | — | 3 | manual |
-| 100 | 100 | flat | full sync (throttled) | 105 | — | — | — | 4011 | manual |
+| 10 | 1000 | flat | incremental Δ=1 | 13 | 0.07 | 5.9 | 64 | 9 | CI |
+| 100 | 1000 | flat | incremental Δ=1 | 103 | 1.1 | 5.9 | 64 | 28 | CI |
+| 1000 | 1000 | flat | incremental Δ=1 | 1003 | 9.2 | 68 | 890 | 145 | CI |
+| 1000 | 1000 | flat | full sync | 1003 | 9.2 | 68 | 890 | 180 | CI |
+| 10000 | 1000 | flat | incremental Δ=1 | 10003 | 97 | 748 | 7624 | 1222 | CI |
+| 10000 | 1000 | flat | full sync | 10004 | 97 | 748 | 7624 | 1212 | CI |
+| 10 | 100 | flat | full sync (throttled) | 13 | — | — | — | 8 | manual |
+| 100 | 100 | flat | full sync (throttled) | 105 | — | — | — | 4029 | manual |
 
 ### Delta cardinality (fixed G=1000, varying Δ)
 
@@ -52,9 +52,9 @@ Confirms group refetch cost is constant regardless of delta size.
 
 | Groups | Delta users | API calls | Mock sync (ms) |
 |--------|-------------|-----------|----------------|
-| 1000 | 1 | 1003 | 51 |
-| 1000 | 100 | 1003 | 53 |
-| 1000 | 1000 | 1003 | 59 |
+| 1000 | 1 | 1003 | 149 |
+| 1000 | 100 | 1003 | 154 |
+| 1000 | 1000 | 1003 | 173 |
 
 ### No-change incremental sync
 
@@ -62,12 +62,12 @@ When no entities change, group fetch is skipped entirely.
 
 | API calls | Mock sync (µs) |
 |-----------|----------------|
-| 2 | 115 |
+| 2 | 114 |
 
 ### Ceiling estimate
 
-With mock latency (local httptest, ~0.05ms/call), 10k groups completes
-in ~450ms — well under the 900s ceiling. Projecting with realistic API
+With mock latency (local httptest, ~0.12ms/call), 10k groups completes
+in ~1.2s — well under the 900s ceiling. Projecting with realistic API
 latency:
 
 | Groups | API calls | Graph CPU (ms) | At 10ms/call (s) | At 50ms/call (s) | At 100ms/call (s) |
@@ -89,11 +89,11 @@ The ceiling is determined by API call count × per-call latency.
 ### Memoization finding
 
 `BenchmarkMembershipGraph_AllUsers` with 1000 users × 10000 groups (flat)
-runs in ~7.6s without memoization. Each `userTransitiveGroups` call
-recomputes BFS independently. At 10k groups, per-user expand takes 748µs
-— not a bottleneck relative to the API call cost (~50ms+ per call in
-production). Memoization would help if graph CPU became dominant, but at
-realistic API latencies, group fetch API calls are 100× more expensive
+takes ~26ms per iteration without memoization. Each `userTransitiveGroups`
+call recomputes BFS independently. At 10k groups, per-user expand takes
+~2.3ms — not a bottleneck relative to the API call cost (~50ms+ per call
+in production). Memoization would help if graph CPU became dominant, but
+at realistic API latencies, group fetch API calls are 100× more expensive
 than graph operations. Documented for preparation for [elastic/beats#51210](https://github.com/elastic/beats/pull/51210);
 no optimisation needed.
 
@@ -108,8 +108,8 @@ Dense topology benchmark (5k groups × 500 members = 2.5M edges, flat):
 
 | Backend | Heap delta | RSS | Scratch file | Build + 100 reads |
 |---------|-----------|-----|-------------|-------------------|
-| bbolt (scratchBackend) | ~133 MB | ~582 MB | ~277 MB | ~11 s |
-| in-memory (mapBackend) | ~114 MB | ~291 MB | — | ~0.35 s |
+| bbolt (scratchBackend) | ~126 MB | ~422 MB | ~103 MB | ~11 s |
+| in-memory (mapBackend) | ~119 MB | ~311 MB | — | ~0.41 s |
 
 Key observations:
 
@@ -124,7 +124,7 @@ Key observations:
 - **Wall time** for the build phase is dominated by bbolt I/O. In
   production this is negligible relative to the API call latency
   (5000 group-member fetches × 50–100ms/call = 250–500s).
-- **Scratch file size** of ~277 MB for 2.5M edges is within typical
+- **Scratch file size** of ~103 MB for 2.5M edges is within typical
   ephemeral disk limits for agentless containers.
 
 Reproduce with:
@@ -143,7 +143,7 @@ Synthetic throttle policy: 429 + Retry-After: 1s every 50 requests.
 
 | Groups | Total requests | Throttle hits | Wall-clock (s) | Throttle wait (s) |
 |--------|---------------|---------------|----------------|-------------------|
-| 10 | 13 | 0 | 0.003 | 0 |
+| 10 | 13 | 0 | 0.008 | 0 |
 | 100 | 105 | 2 | 4.0 | 2 |
 
 At 1000 groups (~1003 requests), expect ~20 throttle hits × 1s = ~20s
@@ -157,8 +157,8 @@ FullSync with 1000 users × 1000 groups (flat, no throttle):
 |--------|-------|
 | Documents published | 1000 |
 | API calls | 1004 |
-| Wall-clock time | 72ms |
-| Per-API-call avg | 72µs |
+| Wall-clock time | 158ms |
+| Per-API-call avg | 157µs |
 
 The decomposed model (API calls × mock latency + graph CPU) closely
 tracks the measured end-to-end time, confirming the model is sound for
