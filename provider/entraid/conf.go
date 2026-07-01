@@ -26,7 +26,8 @@ type Config struct {
 	// "users", or "devices". Empty and "all" are equivalent.
 	Dataset string `json:"dataset"`
 
-	// EnrichWith controls optional enrichment. Valid values: mfa, none.
+	// EnrichWith controls optional enrichment. Valid values:
+	// mfa, sign_in_activity, none.
 	EnrichWith []string `json:"enrich_with"`
 
 	SelectUsers   []string `json:"select_users"`
@@ -81,8 +82,9 @@ var (
 )
 
 var validEnrichments = map[string]bool{
-	"mfa":  true,
-	"none": true,
+	"mfa":              true,
+	"sign_in_activity": true,
+	"none":             true,
 }
 
 // Validate returns an error if the Config is invalid.
@@ -135,6 +137,15 @@ func (c *Config) wantDevices() bool {
 func (c *Config) wantMFA() bool {
 	for _, e := range c.EnrichWith {
 		if strings.EqualFold(e, "mfa") {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) wantSignInActivity() bool {
+	for _, e := range c.EnrichWith {
+		if strings.EqualFold(e, "sign_in_activity") {
 			return true
 		}
 	}
