@@ -111,6 +111,14 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		}
 	}
 
+	var signIn map[string]*SignInActivityDetails
+	if p.cfg.wantSignInActivity() && len(users) > 0 {
+		signIn, err = gc.getSignInActivity(ctx)
+		if err != nil {
+			log.Warn("sign-in activity enrichment failed, continuing without sign-in data", "error", err)
+		}
+	}
+
 	now := time.Now().UTC()
 
 	for _, u := range users {
@@ -133,6 +141,11 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		if mfa != nil {
 			if m, ok := mfa[u.id]; ok {
 				fields["user.risk.mfa"] = m
+			}
+		}
+		if signIn != nil {
+			if s, ok := signIn[u.id]; ok {
+				fields["azure_ad.signInActivity"] = s
 			}
 		}
 		if err := pub(ctx, entcollect.Document{
@@ -267,6 +280,14 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 		}
 	}
 
+	var signIn map[string]*SignInActivityDetails
+	if p.cfg.wantSignInActivity() && len(users) > 0 {
+		signIn, err = gc.getSignInActivity(ctx)
+		if err != nil {
+			log.Warn("sign-in activity enrichment failed, continuing without sign-in data", "error", err)
+		}
+	}
+
 	now := time.Now().UTC()
 
 	for _, u := range users {
@@ -289,6 +310,11 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 		if mfa != nil {
 			if m, ok := mfa[u.id]; ok {
 				fields["user.risk.mfa"] = m
+			}
+		}
+		if signIn != nil {
+			if s, ok := signIn[u.id]; ok {
+				fields["azure_ad.signInActivity"] = s
 			}
 		}
 		if err := pub(ctx, entcollect.Document{

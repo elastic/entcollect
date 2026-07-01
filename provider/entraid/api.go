@@ -60,6 +60,18 @@ type MFADetails struct {
 	UserType                                      string   `json:"userType"`
 }
 
+// SignInActivityDetails holds sign-in activity timestamps for a user.
+// This data is not persisted; it is repopulated each sync cycle when
+// the "sign_in_activity" enrich_with option is set.
+type SignInActivityDetails struct {
+	LastSignInDateTime                string `json:"lastSignInDateTime,omitempty"`
+	LastSignInRequestID               string `json:"lastSignInRequestId,omitempty"`
+	LastNonInteractiveSignInDateTime  string `json:"lastNonInteractiveSignInDateTime,omitempty"`
+	LastNonInteractiveSignInRequestID string `json:"lastNonInteractiveSignInRequestId,omitempty"`
+	LastSuccessfulSignInDateTime      string `json:"lastSuccessfulSignInDateTime,omitempty"`
+	LastSuccessfulSignInRequestID     string `json:"lastSuccessfulSignInRequestId,omitempty"`
+}
+
 // removed matches the @removed annotation in delta responses.
 type removed struct {
 	Reason string `json:"reason"`
@@ -247,6 +259,38 @@ func (g *graphClient) getMFADetails(ctx context.Context) (map[string]*MFADetails
 		}
 		if resp.NextLink == fetchURL {
 			return result, fmt.Errorf("MFA details: next link loop detected")
+		}
+		fetchURL = resp.NextLink
+	}
+}
+
+// getSignInActivity fetches sign-in activity for all users via
+// /users?$select=id,signInActivity. Returns a map keyed by user ID.
+// The signInActivity property cannot be included in delta $select —
+// Microsoft stores it outside the main directory data store.
+func (g *graphClient) getSignInActivity(ctx context.Context) (map[string]*SignInActivityDetails, error) {
+	type signInEntry struct {
+		ID             string                `json:"id"`
+		SignInActivity *SignInActivityDetails `json:"signInActivity"`
+	}
+	startURL := g.baseURL + "/users?$select=id,signInActivity"
+	result := make(map[string]*SignInActivityDetails)
+	fetchURL := startURL
+	for {
+		var resp deltaResponse[signInEntry]
+		if err := g.doJSON(ctx, fetchURL, &resp); err != nil {
+			return nil, fmt.Errorf("fetch sign-in activity: %w", err)
+		}
+		for _, e := range resp.Value {
+			if e.SignInActivity != nil {
+				result[e.ID] = e.SignInActivity
+			}
+		}
+		if resp.NextLink == "" {
+			return result, nil
+		}
+		if resp.NextLink == fetchURL {
+			return result, fmt.Errorf("sign-in activity: next link loop detected")
 		}
 		fetchURL = resp.NextLink
 	}

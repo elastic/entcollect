@@ -392,6 +392,66 @@ func TestFullSync_MFAEnrichment(t *testing.T) {
 	}
 }
 
+func TestFullSync_SignInActivityEnrichment(t *testing.T) {
+	type signInEntry struct {
+		ID             string                `json:"id"`
+		SignInActivity *SignInActivityDetails `json:"signInActivity"`
+	}
+	srv, cfg := startTestGraph(t, testGraphOpts{
+		fullUsers: []json.RawMessage{
+			rawUser("u1", map[string]any{"displayName": "Alice"}),
+			rawUser("u2", map[string]any{"displayName": "Bob"}),
+		},
+		fullDevices:  []json.RawMessage{},
+		groups:       []Group{},
+		groupMembers: map[string][]Member{},
+		deviceOwners: map[string][]map[string]any{},
+		deviceUsers:  map[string][]map[string]any{},
+		signInActivityResponse: deltaResponse[signInEntry]{
+			Value: []signInEntry{
+				{
+					ID: "u1",
+					SignInActivity: &SignInActivityDetails{
+						LastSignInDateTime:               "2024-01-15T08:00:00Z",
+						LastSignInRequestID:              "req-1",
+						LastNonInteractiveSignInDateTime: "2024-01-15T08:30:00Z",
+					},
+				},
+			},
+		},
+	})
+	defer srv.Close()
+
+	cfg.EnrichWith = []string{"sign_in_activity"}
+	p := NewWithClient(cfg, srv.Client())
+	store := newTestStore()
+	docs := collectDocs(context.Background(), t, p, store, true)
+
+	if len(docs) != 2 {
+		t.Fatalf("got %d docs; want 2", len(docs))
+	}
+
+	sort.Slice(docs, func(i, j int) bool { return docs[i].ID < docs[j].ID })
+
+	sia, ok := docs[0].Fields["azure_ad.signInActivity"].(*SignInActivityDetails)
+	if !ok {
+		t.Fatalf("u1 azure_ad.signInActivity is %T; want *SignInActivityDetails", docs[0].Fields["azure_ad.signInActivity"])
+	}
+	if sia.LastSignInDateTime != "2024-01-15T08:00:00Z" {
+		t.Errorf("u1 LastSignInDateTime = %q; want 2024-01-15T08:00:00Z", sia.LastSignInDateTime)
+	}
+	if sia.LastSignInRequestID != "req-1" {
+		t.Errorf("u1 LastSignInRequestID = %q; want req-1", sia.LastSignInRequestID)
+	}
+	if sia.LastNonInteractiveSignInDateTime != "2024-01-15T08:30:00Z" {
+		t.Errorf("u1 LastNonInteractiveSignInDateTime = %q; want 2024-01-15T08:30:00Z", sia.LastNonInteractiveSignInDateTime)
+	}
+
+	if _, ok := docs[1].Fields["azure_ad.signInActivity"]; ok {
+		t.Error("u2 should have no sign-in activity data")
+	}
+}
+
 func TestPublisherError_StopsSync(t *testing.T) {
 	srv, cfg := startTestGraph(t, testGraphOpts{
 		fullUsers: []json.RawMessage{
@@ -905,7 +965,8 @@ type testGraphOpts struct {
 	deviceOwners map[string][]map[string]any
 	deviceUsers  map[string][]map[string]any
 
-	mfaResponse any
+	mfaResponse            any
+	signInActivityResponse any
 }
 
 func testGraphMux(t testing.TB, opts testGraphOpts, srvURL *string) *http.ServeMux {
@@ -1007,6 +1068,17 @@ func testGraphMux(t testing.TB, opts testGraphOpts, srvURL *string) *http.ServeM
 		err := json.NewEncoder(w).Encode(opts.mfaResponse)
 		if err != nil {
 			t.Errorf("encode mfa response: %v", err)
+		}
+	})
+
+	mux.HandleFunc("GET /v1.0/users", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("$select") != "id,signInActivity" {
+			http.NotFound(w, r)
+			return
+		}
+		err := json.NewEncoder(w).Encode(opts.signInActivityResponse)
+		if err != nil {
+			t.Errorf("encode sign-in activity response: %v", err)
 		}
 	})
 
