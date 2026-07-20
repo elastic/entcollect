@@ -52,12 +52,16 @@ var _ entcollect.Provider = (*Provider)(nil)
 
 // New returns a Provider with a default HTTP client.
 func New(cfg Config) *Provider {
-	return &Provider{cfg: cfg, client: http.DefaultClient}
+	return NewWithClient(cfg, nil)
 }
 
 // NewWithClient returns a Provider using the given HTTP client as the
 // base transport. For OAuth2, the OAuth2 transport wraps this client.
+// A nil client uses http.DefaultClient.
 func NewWithClient(cfg Config, client *http.Client) *Provider {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	return &Provider{cfg: cfg, client: client}
 }
 
