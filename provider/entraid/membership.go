@@ -5,6 +5,7 @@
 package entraid
 
 import (
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -133,7 +134,11 @@ func newMapBackend() *mapBackend {
 }
 
 // addGroup implements membershipGraph.addGroup by storing in a map.
+// Empty IDs are rejected to match bbolt semantics.
 func (mg *mapBackend) addGroup(g Group) error {
+	if g.ID == "" {
+		return errors.New("key required")
+	}
 	mg.groups[g.ID] = g
 	return nil
 }

@@ -270,7 +270,7 @@ func (g *graphClient) getMFADetails(ctx context.Context) (map[string]*MFADetails
 // Microsoft stores it outside the main directory data store.
 func (g *graphClient) getSignInActivity(ctx context.Context) (map[string]*SignInActivityDetails, error) {
 	type signInEntry struct {
-		ID             string                `json:"id"`
+		ID             string                 `json:"id"`
 		SignInActivity *SignInActivityDetails `json:"signInActivity"`
 	}
 	startURL := g.baseURL + "/users?$select=id,signInActivity"

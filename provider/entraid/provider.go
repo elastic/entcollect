@@ -395,6 +395,10 @@ func (p *Provider) buildGraph(ctx context.Context, gc *graphClient) (membershipG
 	}
 
 	for _, g := range groups {
+		if g.ID == "" {
+			gc.log.Warn("skipping group with empty id", slog.String("displayName", g.DisplayName))
+			continue
+		}
 		if err := mg.addGroup(g); err != nil {
 			mg.close()
 			return nil, fmt.Errorf("add group %s: %w", g.ID, err)
