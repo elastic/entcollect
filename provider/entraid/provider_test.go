@@ -48,7 +48,7 @@ func TestFullSync_InitialFetch(t *testing.T) {
 
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
-	docs := collectDocs(context.Background(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, true)
 
 	if len(docs) != 3 {
 		t.Fatalf("got %d docs; want 3 (2 users + 1 device)", len(docs))
@@ -124,10 +124,10 @@ func TestIncrementalSync_WithChanges(t *testing.T) {
 	store := newTestStore()
 
 	// Full sync first to populate delta links.
-	_ = collectDocs(context.Background(), t, p, store, true)
+	_ = collectDocs(t.Context(), t, p, store, true)
 
 	// Incremental — should get delta results.
-	docs := collectDocs(context.Background(), t, p, store, false)
+	docs := collectDocs(t.Context(), t, p, store, false)
 
 	sort.Slice(docs, func(i, j int) bool { return docs[i].ID < docs[j].ID })
 	if len(docs) != 2 {
@@ -160,8 +160,8 @@ func TestIncrementalSync_NoChanges(t *testing.T) {
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
 
-	_ = collectDocs(context.Background(), t, p, store, true)
-	docs := collectDocs(context.Background(), t, p, store, false)
+	_ = collectDocs(t.Context(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, false)
 
 	if len(docs) != 0 {
 		t.Errorf("got %d docs; want 0 (no changes)", len(docs))
@@ -189,7 +189,7 @@ func TestFullSync_TransitiveGroupMembership(t *testing.T) {
 
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
-	docs := collectDocs(context.Background(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, true)
 
 	if len(docs) != 1 {
 		t.Fatalf("got %d docs; want 1", len(docs))
@@ -209,6 +209,40 @@ func TestFullSync_TransitiveGroupMembership(t *testing.T) {
 		if ids[i] != want[i] {
 			t.Errorf("groups[%d] = %s; want %s", i, ids[i], want[i])
 		}
+	}
+}
+
+func TestFullSync_EmptyGroupIDSkipped(t *testing.T) {
+	srv, cfg := startTestGraph(t, testGraphOpts{
+		fullUsers: []json.RawMessage{
+			rawUser("u1", map[string]any{"displayName": "Alice"}),
+		},
+		fullDevices: []json.RawMessage{},
+		groups: []Group{
+			{ID: "", DisplayName: "Ghost"},
+			{ID: "g1", DisplayName: "Engineering"},
+		},
+		groupMembers: map[string][]Member{
+			"g1": {{ID: "u1", Type: odataTypeUser}},
+		},
+		deviceOwners: map[string][]map[string]any{},
+		deviceUsers:  map[string][]map[string]any{},
+	})
+	defer srv.Close()
+
+	p := NewWithClient(cfg, srv.Client())
+	store := newTestStore()
+	docs := collectDocs(t.Context(), t, p, store, true)
+
+	if len(docs) != 1 {
+		t.Fatalf("got %d docs; want 1", len(docs))
+	}
+	if docs[0].ID != "u1" {
+		t.Errorf("doc ID = %s; want u1", docs[0].ID)
+	}
+	ug, ok := docs[0].Fields["user.group"].([]GroupECS)
+	if !ok || len(ug) != 1 || ug[0].ID != "g1" {
+		t.Errorf("u1 user.group = %v; want [{g1 Engineering}]", docs[0].Fields["user.group"])
 	}
 }
 
@@ -282,8 +316,8 @@ func TestIncrementalSync_ExpiredDeltaLink(t *testing.T) {
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
 
-	_ = collectDocs(context.Background(), t, p, store, true)
-	docs := collectDocs(context.Background(), t, p, store, false)
+	_ = collectDocs(t.Context(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, false)
 
 	if len(docs) != 1 {
 		t.Fatalf("got %d docs; want 1 (recovered from expired delta link)", len(docs))
@@ -304,7 +338,7 @@ func TestFullSync_DatasetUsers(t *testing.T) {
 	cfg.Dataset = "users"
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
-	docs := collectDocs(context.Background(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, true)
 
 	for _, doc := range docs {
 		if doc.Kind != entcollect.KindUser {
@@ -327,7 +361,7 @@ func TestFullSync_DatasetDevices(t *testing.T) {
 	cfg.Dataset = "devices"
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
-	docs := collectDocs(context.Background(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, true)
 
 	for _, doc := range docs {
 		if doc.Kind != entcollect.KindDevice {
@@ -368,7 +402,7 @@ func TestFullSync_MFAEnrichment(t *testing.T) {
 	cfg.EnrichWith = []string{"mfa"}
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
-	docs := collectDocs(context.Background(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, true)
 
 	if len(docs) != 2 {
 		t.Fatalf("got %d docs; want 2", len(docs))
@@ -394,7 +428,7 @@ func TestFullSync_MFAEnrichment(t *testing.T) {
 
 func TestFullSync_SignInActivityEnrichment(t *testing.T) {
 	type signInEntry struct {
-		ID             string                `json:"id"`
+		ID             string                 `json:"id"`
 		SignInActivity *SignInActivityDetails `json:"signInActivity"`
 	}
 	srv, cfg := startTestGraph(t, testGraphOpts{
@@ -425,7 +459,7 @@ func TestFullSync_SignInActivityEnrichment(t *testing.T) {
 	cfg.EnrichWith = []string{"sign_in_activity"}
 	p := NewWithClient(cfg, srv.Client())
 	store := newTestStore()
-	docs := collectDocs(context.Background(), t, p, store, true)
+	docs := collectDocs(t.Context(), t, p, store, true)
 
 	if len(docs) != 2 {
 		t.Fatalf("got %d docs; want 2", len(docs))
@@ -474,7 +508,7 @@ func TestPublisherError_StopsSync(t *testing.T) {
 		return pubErr
 	}
 
-	err := p.FullSync(context.Background(), store, pub, slog.Default())
+	err := p.FullSync(t.Context(), store, pub, slog.Default())
 	if !errors.Is(err, pubErr) {
 		t.Errorf("error = %v; want pipeline full", err)
 	}
@@ -593,7 +627,7 @@ func TestEntraidRateLimitProfile(t *testing.T) {
 
 			reqCount.Store(0)
 			start := time.Now()
-			err := p.FullSync(context.Background(), store, pub, log)
+			err := p.FullSync(t.Context(), store, pub, log)
 			elapsed := time.Since(start)
 
 			if err != nil {
@@ -626,13 +660,13 @@ func TestEntraidEndToEndSanityCheck(t *testing.T) {
 
 	groups, members := generateGroups(nGroups, nUsers)
 	opts := testGraphOpts{
-		fullUsers:        generateUsers(nUsers),
-		fullDevices:      []json.RawMessage{},
-		alwaysFullUsers:  true,
-		groups:           groups,
-		groupMembers:     members,
-		deviceOwners:     map[string][]map[string]any{},
-		deviceUsers:      map[string][]map[string]any{},
+		fullUsers:       generateUsers(nUsers),
+		fullDevices:     []json.RawMessage{},
+		alwaysFullUsers: true,
+		groups:          groups,
+		groupMembers:    members,
+		deviceOwners:    map[string][]map[string]any{},
+		deviceUsers:     map[string][]map[string]any{},
 	}
 	srv, cfg, rc := startGraph(t, opts)
 	defer srv.Close()
@@ -649,7 +683,7 @@ func TestEntraidEndToEndSanityCheck(t *testing.T) {
 
 	rc.reset()
 	start := time.Now()
-	err := p.FullSync(context.Background(), store, pub, log)
+	err := p.FullSync(t.Context(), store, pub, log)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -684,20 +718,20 @@ func BenchmarkEntraidFullSync(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			groups, members := generateGroups(tc.groups, tc.users)
 			opts := testGraphOpts{
-				fullUsers:        generateUsers(tc.users),
-				fullDevices:      []json.RawMessage{},
-				alwaysFullUsers:  true,
-				groups:           groups,
-				groupMembers:     members,
-				deviceOwners:     map[string][]map[string]any{},
-				deviceUsers:      map[string][]map[string]any{},
+				fullUsers:       generateUsers(tc.users),
+				fullDevices:     []json.RawMessage{},
+				alwaysFullUsers: true,
+				groups:          groups,
+				groupMembers:    members,
+				deviceOwners:    map[string][]map[string]any{},
+				deviceUsers:     map[string][]map[string]any{},
 			}
 			srv, cfg, rc := startGraph(b, opts)
 			b.Cleanup(srv.Close)
 
 			p := NewWithClient(cfg, srv.Client())
 			log := benchLog()
-			ctx := context.Background()
+			ctx := b.Context()
 
 			b.ReportAllocs()
 			rc.reset()
@@ -743,7 +777,7 @@ func BenchmarkEntraidIncrementalSync_NoChange(b *testing.B) {
 
 	p := NewWithClient(cfg, srv.Client())
 	log := benchLog()
-	ctx := context.Background()
+	ctx := b.Context()
 
 	// Run full sync once to establish delta links.
 	store := newTestStore()
@@ -773,10 +807,10 @@ func BenchmarkEntraidIncrementalSync_OneChange(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			groups, members := generateGroups(nGroups, 1000)
 			opts := testGraphOpts{
-				fullUsers:   generateUsers(1000),
-				deltaUsers:  []json.RawMessage{rawUser("u0", map[string]any{"displayName": "User 0 Updated"})},
-				fullDevices: []json.RawMessage{},
-				groups:      groups,
+				fullUsers:    generateUsers(1000),
+				deltaUsers:   []json.RawMessage{rawUser("u0", map[string]any{"displayName": "User 0 Updated"})},
+				fullDevices:  []json.RawMessage{},
+				groups:       groups,
 				groupMembers: members,
 				deviceOwners: map[string][]map[string]any{},
 				deviceUsers:  map[string][]map[string]any{},
@@ -786,7 +820,7 @@ func BenchmarkEntraidIncrementalSync_OneChange(b *testing.B) {
 
 			p := NewWithClient(cfg, srv.Client())
 			log := benchLog()
-			ctx := context.Background()
+			ctx := b.Context()
 
 			// Establish delta links.
 			store := newTestStore()
@@ -842,7 +876,7 @@ func BenchmarkEntraidIncrementalSync_DeltaCardinality(b *testing.B) {
 
 			p := NewWithClient(cfg, srv.Client())
 			log := benchLog()
-			ctx := context.Background()
+			ctx := b.Context()
 
 			// Establish delta links.
 			store := newTestStore()

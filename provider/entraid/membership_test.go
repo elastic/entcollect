@@ -194,6 +194,14 @@ func TestMembershipGraph_NoGroups(t *testing.T) {
 	}
 }
 
+func TestMapBackend_AddGroupEmptyID(t *testing.T) {
+	mg := newMapBackend()
+	err := mg.addGroup(Group{ID: "", DisplayName: "No ID"})
+	if err == nil {
+		t.Error("addGroup with empty ID should return an error")
+	}
+}
+
 func sortGroups(gs []GroupECS) {
 	slices.SortFunc(gs, func(a, b GroupECS) int { return cmp.Compare(a.ID, b.ID) })
 }

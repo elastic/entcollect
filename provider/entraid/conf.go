@@ -50,9 +50,9 @@ const (
 var (
 	defaultLoginScopes = []string{"https://graph.microsoft.com/.default"}
 
-	defaultSelectUsers   = []string{"accountEnabled", "userPrincipalName", "mail", "displayName", "givenName", "surname", "jobTitle", "officeLocation", "mobilePhone", "businessPhones"}
-	defaultSelectGroups  = []string{"displayName", "members"}
-	defaultSelectDevices = []string{"accountEnabled", "deviceId", "displayName", "operatingSystem", "operatingSystemVersion", "physicalIds", "extensionAttributes", "alternativeSecurityIds"}
+	defaultSelectUsers   = []string{"id", "accountEnabled", "userPrincipalName", "mail", "displayName", "givenName", "surname", "jobTitle", "officeLocation", "mobilePhone", "businessPhones"}
+	defaultSelectGroups  = []string{"id", "displayName"}
+	defaultSelectDevices = []string{"id", "accountEnabled", "deviceId", "displayName", "operatingSystem", "operatingSystemVersion", "physicalIds", "extensionAttributes", "alternativeSecurityIds"}
 )
 
 // DefaultConfig returns a Config with sensible defaults matching the
