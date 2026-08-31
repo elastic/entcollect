@@ -275,10 +275,14 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 
 			if enrich["groups"] {
 				groups, _, err := GetUserGroups(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
-				if err != nil {
+				switch {
+				case err == nil:
+					fields["groups"] = groups
+				case ctx.Err() != nil:
 					return fmt.Errorf("okta: get groups for user %s: %w", u.ID, err)
+				default:
+					log.Warn("groups enrichment failed, continuing without groups data", "user", u.ID, "error", err)
 				}
-				fields["groups"] = groups
 			}
 			if supervisesMapping != nil {
 				if subs := supervisesMapping[u.ID]; subs != nil {
@@ -540,45 +544,70 @@ func (p *Provider) paginateDevices(ctx context.Context, cli *http.Client, key st
 }
 
 // enrichUser adds optional per-user enrichment to fields.
+//
+// Enrichment failures are not fatal: an entity that disappears between
+// the bulk fetch and the enrichment call (typically a deleted user or
+// role, surfacing as an API 404) is logged and skipped so that a single
+// stale entity cannot abort the whole sync. This matches the legacy
+// filebeat provider's behaviour. The one exception is the sync's own
+// context being done (ctx.Err() != nil): then the failure is propagated
+// so that a cancelled sync aborts promptly instead of warning through
+// every remaining user.
 func (p *Provider) enrichUser(ctx context.Context, cli *http.Client, key string, lim *RateLimiter, log *slog.Logger, enrich map[string]bool, permCache map[string][]Permission, u *User, fields map[string]any) error {
 	if enrich["factors"] {
 		factors, _, err := GetUserFactors(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
-		if err != nil {
+		switch {
+		case err == nil:
+			fields["factors"] = factors
+		case ctx.Err() != nil:
 			return fmt.Errorf("okta: get factors for user %s: %w", u.ID, err)
+		default:
+			log.Warn("factors enrichment failed, continuing without factors data", "user", u.ID, "error", err)
 		}
-		fields["factors"] = factors
 	}
 	if enrich["roles"] {
 		roles, _, err := GetUserRoles(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
-		if err != nil {
-			return fmt.Errorf("okta: get roles for user %s: %w", u.ID, err)
-		}
-		if enrich["permissions"] {
-			for i := range roles {
-				roleID := roles[i].RoleID
-				if roleID == "" {
-					roleID = roles[i].ID
+		switch {
+		case err == nil:
+			if enrich["permissions"] {
+				for i := range roles {
+					roleID := roles[i].RoleID
+					if roleID == "" {
+						roleID = roles[i].ID
+					}
+					if cached, ok := permCache[roleID]; ok {
+						roles[i].Permissions = cached
+						continue
+					}
+					perms, _, err := GetRolePermissions(ctx, cli, p.cfg.Domain, key, roleID, lim, log)
+					if err != nil {
+						if ctx.Err() != nil {
+							return fmt.Errorf("okta: get permissions for role %s: %w", roleID, err)
+						}
+						log.Warn("permissions enrichment failed, continuing without permissions data", "user", u.ID, "role", roleID, "error", err)
+						continue
+					}
+					permCache[roleID] = perms
+					roles[i].Permissions = perms
 				}
-				if cached, ok := permCache[roleID]; ok {
-					roles[i].Permissions = cached
-					continue
-				}
-				perms, _, err := GetRolePermissions(ctx, cli, p.cfg.Domain, key, roleID, lim, log)
-				if err != nil {
-					return fmt.Errorf("okta: get permissions for role %s: %w", roleID, err)
-				}
-				permCache[roleID] = perms
-				roles[i].Permissions = perms
 			}
+			fields["roles"] = roles
+		case ctx.Err() != nil:
+			return fmt.Errorf("okta: get roles for user %s: %w", u.ID, err)
+		default:
+			log.Warn("roles enrichment failed, continuing without roles data", "user", u.ID, "error", err)
 		}
-		fields["roles"] = roles
 	}
 	if enrich["devices"] {
 		devs, _, err := GetUserDevices(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
-		if err != nil {
+		switch {
+		case err == nil:
+			fields["devices"] = devs
+		case ctx.Err() != nil:
 			return fmt.Errorf("okta: get devices for user %s: %w", u.ID, err)
+		default:
+			log.Warn("devices enrichment failed, continuing without devices data", "user", u.ID, "error", err)
 		}
-		fields["devices"] = devs
 	}
 	return nil
 }

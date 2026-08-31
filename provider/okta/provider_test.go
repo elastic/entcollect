@@ -7,6 +7,7 @@ package okta_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -382,6 +383,162 @@ func TestIncrementalSync_PerUserGroups(t *testing.T) {
 	}
 }
 
+func TestFullSync_EnrichmentSkipsDeletedEntities(t *testing.T) {
+	now := time.Now()
+	fs := &fakeOktaServer{
+		users: []okta.User{
+			{ID: "u1", Status: "ACTIVE", LastUpdated: now},
+			{ID: "u2", Status: "ACTIVE", LastUpdated: now},
+		},
+		roles: map[string][]okta.Role{
+			"u1": {{ID: "ra1", RoleID: "cr-deleted", Type: "CUSTOM", Label: "Deleted role"}},
+			"u2": {{ID: "ra2", RoleID: "cr-live", Type: "CUSTOM", Label: "Live role"}},
+		},
+		perms: map[string][]okta.Permission{
+			"cr-live": {{Label: "okta.users.read"}},
+		},
+		// u1 was deleted between the bulk user fetch and its factors
+		// enrichment call, and u1's custom role definition was deleted:
+		// both enrichment calls return 404.
+		fail: map[string]int{
+			"/api/v1/users/u1/factors":                 http.StatusNotFound,
+			"/api/v1/iam/roles/cr-deleted/permissions": http.StatusNotFound,
+		},
+	}
+
+	srv := httptest.NewTLSServer(fs.handler(t))
+	t.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+
+	cfg := okta.DefaultConfig()
+	cfg.Domain = u.Host
+	cfg.Token = "test-token"
+	cfg.LimitFixed = intPtr(1000)
+	cfg.Dataset = "users"
+	cfg.EnrichWith = []string{"factors", "roles", "permissions"}
+
+	p := okta.NewWithClient(cfg, srv.Client())
+	store := newMemStore()
+
+	docs := collectDocs(t.Context(), t, p, store, true)
+
+	userDocs := filterByKind(docs, entcollect.KindUser)
+	if len(userDocs) != 2 {
+		t.Fatalf("got %d user docs; want 2 (enrichment failures must not abort the sync)", len(userDocs))
+	}
+	for _, doc := range userDocs {
+		roles, ok := doc.Fields["roles"].([]okta.Role)
+		if !ok || len(roles) != 1 {
+			t.Errorf("user %s roles = %v; want 1 role", doc.ID, doc.Fields["roles"])
+			continue
+		}
+		switch doc.ID {
+		case "u1":
+			if _, ok := doc.Fields["factors"]; ok {
+				t.Errorf("user u1 has factors field; want enrichment skipped")
+			}
+			if len(roles[0].Permissions) != 0 {
+				t.Errorf("user u1 role permissions = %v; want none (enrichment skipped)", roles[0].Permissions)
+			}
+		case "u2":
+			if _, ok := doc.Fields["factors"]; !ok {
+				t.Errorf("user u2 missing factors field")
+			}
+			if len(roles[0].Permissions) != 1 {
+				t.Errorf("user u2 role permissions = %v; want 1", roles[0].Permissions)
+			}
+		}
+	}
+}
+
+func TestIncrementalSync_GroupsEnrichmentSkipsDeletedUser(t *testing.T) {
+	now := time.Now()
+	fs := &fakeOktaServer{
+		users: []okta.User{
+			{ID: "u1", Status: "ACTIVE", LastUpdated: now},
+			{ID: "u2", Status: "ACTIVE", LastUpdated: now},
+		},
+		groups:  []okta.Group{{ID: "g1", Profile: map[string]any{"name": "Engineering"}}},
+		members: map[string][]string{"g1": {"u1", "u2"}},
+		// u1 was deleted between the bulk user fetch and its per-user
+		// groups enrichment call.
+		fail: map[string]int{"/api/v1/users/u1/groups": http.StatusNotFound},
+	}
+
+	p, _ := newTestProvider(t, fs)
+	store := newMemStore()
+
+	docs := collectDocs(t.Context(), t, p, store, false)
+
+	userDocs := filterByKind(docs, entcollect.KindUser)
+	if len(userDocs) != 2 {
+		t.Fatalf("got %d user docs; want 2 (groups enrichment failure must not abort the sync)", len(userDocs))
+	}
+	for _, doc := range userDocs {
+		_, hasGroups := doc.Fields["groups"]
+		switch doc.ID {
+		case "u1":
+			if hasGroups {
+				t.Errorf("user u1 has groups field; want enrichment skipped")
+			}
+		case "u2":
+			if !hasGroups {
+				t.Errorf("user u2 missing groups field")
+			}
+		}
+	}
+}
+
+func TestFullSync_EnrichmentContextCanceledAborts(t *testing.T) {
+	now := time.Now()
+	fs := &fakeOktaServer{
+		users: []okta.User{
+			{ID: "u1", Status: "ACTIVE", LastUpdated: now},
+			{ID: "u2", Status: "ACTIVE", LastUpdated: now},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancel the sync context during u1's factors enrichment call. The
+	// sync must abort promptly rather than warn-and-continue through
+	// the remaining users.
+	fs.onRequest = func(r *http.Request) {
+		if r.URL.Path == "/api/v1/users/u1/factors" {
+			cancel()
+		}
+	}
+
+	srv := httptest.NewTLSServer(fs.handler(t))
+	t.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+
+	cfg := okta.DefaultConfig()
+	cfg.Domain = u.Host
+	cfg.Token = "test-token"
+	cfg.LimitFixed = intPtr(1000)
+	cfg.Dataset = "users"
+	cfg.EnrichWith = []string{"factors"}
+
+	p := okta.NewWithClient(cfg, srv.Client())
+	store := newMemStore()
+
+	log := slog.New(slog.NewTextHandler(newTestLogWriter(t), nil))
+	pub := func(context.Context, entcollect.Document) error { return nil }
+	err = p.FullSync(ctx, store, pub, log)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("FullSync error = %v; want context.Canceled", err)
+	}
+}
+
 func TestIncrementalSync_NoIdsetOperations(t *testing.T) {
 	now := time.Now()
 	fs := &fakeOktaServer{
@@ -611,15 +768,19 @@ func (m *memStore) Each(fn func(string, func(any) error) (bool, error)) error {
 
 // fakeOktaServer provides configurable mock Okta API responses.
 type fakeOktaServer struct {
-	users    []okta.User
-	groups   []okta.Group
-	members  map[string][]string // group ID → user IDs
-	devices  []okta.Device
-	devUsers map[string][]okta.User // device ID → users
-	requests atomic.Int64
+	users     []okta.User
+	groups    []okta.Group
+	members   map[string][]string // group ID → user IDs
+	devices   []okta.Device
+	devUsers  map[string][]okta.User       // device ID → users
+	roles     map[string][]okta.Role       // user ID → role assignments
+	perms     map[string][]okta.Permission // role ID → permissions
+	fail      map[string]int               // URL path → HTTP status to return
+	onRequest func(r *http.Request)        // optional hook, called before dispatch
+	requests  atomic.Int64
 }
 
-func (fs *fakeOktaServer) resetRequests()     { fs.requests.Store(0) }
+func (fs *fakeOktaServer) resetRequests()      { fs.requests.Store(0) }
 func (fs *fakeOktaServer) requestCount() int64 { return fs.requests.Load() }
 
 func (fs *fakeOktaServer) handler(tb testing.TB) http.Handler {
@@ -713,10 +874,26 @@ func (fs *fakeOktaServer) handler(tb testing.TB) http.Handler {
 	})
 
 	mux.HandleFunc("GET /api/v1/users/{userId}/roles", func(w http.ResponseWriter, r *http.Request) {
+		roles := fs.roles[r.PathValue("userId")]
+		if roles == nil {
+			roles = []okta.Role{}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode([]okta.Role{})
+		err := json.NewEncoder(w).Encode(roles)
 		if err != nil {
 			tb.Errorf("encode roles: %v", err)
+		}
+	})
+
+	mux.HandleFunc("GET /api/v1/iam/roles/{roleId}/permissions", func(w http.ResponseWriter, r *http.Request) {
+		perms := fs.perms[r.PathValue("roleId")]
+		if perms == nil {
+			perms = []okta.Permission{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		err := json.NewEncoder(w).Encode(map[string][]okta.Permission{"permissions": perms})
+		if err != nil {
+			tb.Errorf("encode permissions: %v", err)
 		}
 	})
 
@@ -730,6 +907,15 @@ func (fs *fakeOktaServer) handler(tb testing.TB) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fs.requests.Add(1)
+		if fs.onRequest != nil {
+			fs.onRequest(r)
+		}
+		if status, ok := fs.fail[r.URL.Path]; ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			fmt.Fprintf(w, `{"errorCode":"E0000007","errorSummary":"Not found: %s"}`, r.URL.Path)
+			return
+		}
 		mux.ServeHTTP(w, r)
 	})
 }
