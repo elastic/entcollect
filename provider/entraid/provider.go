@@ -176,8 +176,10 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		} else if len(groups) > 0 {
 			fields["device.group"] = groups
 		}
-		if err := p.enrichDeviceOwnership(ctx, gc, d.id, fields); err != nil {
-			log.Warn("device ownership enrichment failed", "device", d.id, "error", err)
+		if !d.removed {
+			if err := p.enrichDeviceOwnership(ctx, gc, d.id, fields); err != nil {
+				log.Warn("device ownership enrichment failed", "device", d.id, "error", err)
+			}
 		}
 		if err := pub(ctx, entcollect.Document{
 			ID:        d.id,
@@ -345,8 +347,10 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 		} else if len(groups) > 0 {
 			fields["device.group"] = groups
 		}
-		if err := p.enrichDeviceOwnership(ctx, gc, d.id, fields); err != nil {
-			log.Warn("device ownership enrichment failed", "device", d.id, "error", err)
+		if !d.removed {
+			if err := p.enrichDeviceOwnership(ctx, gc, d.id, fields); err != nil {
+				log.Warn("device ownership enrichment failed", "device", d.id, "error", err)
+			}
 		}
 		if err := pub(ctx, entcollect.Document{
 			ID:        d.id,
