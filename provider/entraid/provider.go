@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"time"
 
@@ -130,23 +131,13 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 			action = entcollect.ActionDeleted
 		}
 		fields := map[string]any{
-			"azure_ad": u.Fields,
+			"azure_ad": userAzureAD(u, mfa, signIn),
 			"user.id":  u.id,
 		}
 		if groups, err := userTransitiveGroups(mg, u.id); err != nil {
 			return fmt.Errorf("entraid: transitive groups for user %s: %w", u.id, err)
 		} else if len(groups) > 0 {
 			fields["user.group"] = groups
-		}
-		if mfa != nil {
-			if m, ok := mfa[u.id]; ok {
-				fields["user.risk.mfa"] = m
-			}
-		}
-		if signIn != nil {
-			if s, ok := signIn[u.id]; ok {
-				fields["azure_ad.signInActivity"] = s
-			}
 		}
 		if err := pub(ctx, entcollect.Document{
 			ID:        u.id,
@@ -301,23 +292,13 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 			action = entcollect.ActionDeleted
 		}
 		fields := map[string]any{
-			"azure_ad": u.Fields,
+			"azure_ad": userAzureAD(u, mfa, signIn),
 			"user.id":  u.id,
 		}
 		if groups, err := userTransitiveGroups(mg, u.id); err != nil {
 			return fmt.Errorf("entraid: transitive groups for user %s: %w", u.id, err)
 		} else if len(groups) > 0 {
 			fields["user.group"] = groups
-		}
-		if mfa != nil {
-			if m, ok := mfa[u.id]; ok {
-				fields["user.risk.mfa"] = m
-			}
-		}
-		if signIn != nil {
-			if s, ok := signIn[u.id]; ok {
-				fields["azure_ad.signInActivity"] = s
-			}
 		}
 		if err := pub(ctx, entcollect.Document{
 			ID:        u.id,
@@ -418,6 +399,28 @@ func (p *Provider) buildGraph(ctx context.Context, gc *graphClient) (membershipG
 		}
 	}
 	return mg, nil
+}
+
+// userAzureAD returns the azure_ad field of the document for u: its
+// Graph fields, with any MFA and sign-in activity enrichment for u added
+// as mfa and signInActivity. Keeping one azure_ad map, instead of adding
+// dotted keys next to it, means the enrichment cannot be overwritten when
+// the document's keys are expanded in map order. u.Fields is not modified.
+func userAzureAD(u userEntry, mfa map[string]*MFADetails, signIn map[string]*SignInActivityDetails) map[string]any {
+	m, hasMFA := mfa[u.id]
+	s, hasSignIn := signIn[u.id]
+	if !hasMFA && !hasSignIn {
+		return u.Fields
+	}
+	fields := make(map[string]any, len(u.Fields)+2)
+	maps.Copy(fields, u.Fields)
+	if hasMFA {
+		fields["mfa"] = m
+	}
+	if hasSignIn {
+		fields["signInActivity"] = s
+	}
+	return fields
 }
 
 func (p *Provider) enrichDeviceOwnership(ctx context.Context, gc *graphClient, deviceID string, fields map[string]any) error {

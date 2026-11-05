@@ -410,9 +410,9 @@ func TestFullSync_MFAEnrichment(t *testing.T) {
 
 	sort.Slice(docs, func(i, j int) bool { return docs[i].ID < docs[j].ID })
 
-	mfaData, ok := docs[0].Fields["user.risk.mfa"].(*MFADetails)
+	mfaData, ok := azureAD(t, docs[0])["mfa"].(*MFADetails)
 	if !ok {
-		t.Fatalf("u1 user.risk.mfa is %T; want *MFADetails", docs[0].Fields["user.risk.mfa"])
+		t.Fatalf("u1 azure_ad.mfa is %T; want *MFADetails", azureAD(t, docs[0])["mfa"])
 	}
 	if !mfaData.IsMFACapable {
 		t.Error("u1 should be MFA capable")
@@ -421,7 +421,7 @@ func TestFullSync_MFAEnrichment(t *testing.T) {
 		t.Error("u1 should be MFA registered")
 	}
 
-	if _, ok := docs[1].Fields["user.risk.mfa"]; ok {
+	if _, ok := azureAD(t, docs[1])["mfa"]; ok {
 		t.Error("u2 should have no MFA data")
 	}
 }
@@ -467,9 +467,9 @@ func TestFullSync_SignInActivityEnrichment(t *testing.T) {
 
 	sort.Slice(docs, func(i, j int) bool { return docs[i].ID < docs[j].ID })
 
-	sia, ok := docs[0].Fields["azure_ad.signInActivity"].(*SignInActivityDetails)
+	sia, ok := azureAD(t, docs[0])["signInActivity"].(*SignInActivityDetails)
 	if !ok {
-		t.Fatalf("u1 azure_ad.signInActivity is %T; want *SignInActivityDetails", docs[0].Fields["azure_ad.signInActivity"])
+		t.Fatalf("u1 azure_ad.signInActivity is %T; want *SignInActivityDetails", azureAD(t, docs[0])["signInActivity"])
 	}
 	if sia.LastSignInDateTime != "2024-01-15T08:00:00Z" {
 		t.Errorf("u1 LastSignInDateTime = %q; want 2024-01-15T08:00:00Z", sia.LastSignInDateTime)
@@ -481,9 +481,112 @@ func TestFullSync_SignInActivityEnrichment(t *testing.T) {
 		t.Errorf("u1 LastNonInteractiveSignInDateTime = %q; want 2024-01-15T08:30:00Z", sia.LastNonInteractiveSignInDateTime)
 	}
 
-	if _, ok := docs[1].Fields["azure_ad.signInActivity"]; ok {
+	if _, ok := azureAD(t, docs[1])["signInActivity"]; ok {
 		t.Error("u2 should have no sign-in activity data")
 	}
+}
+
+// TestSync_EnrichmentInAzureAD checks that MFA and sign-in activity are
+// added inside the user's azure_ad map, next to its Graph fields, in both
+// full and incremental syncs. The legacy provider writes them there and
+// the Entra ID integration reads them there. A separate dotted key such as
+// azure_ad.signInActivity next to the azure_ad map is lost when a
+// publisher expands the keys in map order and sets azure_ad second.
+func TestSync_EnrichmentInAzureAD(t *testing.T) {
+	type mfaEntry struct {
+		ID string `json:"id"`
+		MFADetails
+	}
+	type signInEntry struct {
+		ID             string                 `json:"id"`
+		SignInActivity *SignInActivityDetails `json:"signInActivity"`
+	}
+	srv, cfg := startTestGraph(t, testGraphOpts{
+		fullUsers: []json.RawMessage{
+			rawUser("u1", map[string]any{"displayName": "Alice"}),
+		},
+		deltaUsers: []json.RawMessage{
+			rawUser("u1", map[string]any{"displayName": "Alice Updated"}),
+		},
+		fullDevices:  []json.RawMessage{},
+		groups:       []Group{},
+		groupMembers: map[string][]Member{},
+		deviceOwners: map[string][]map[string]any{},
+		deviceUsers:  map[string][]map[string]any{},
+		mfaResponse: deltaResponse[mfaEntry]{
+			Value: []mfaEntry{{ID: "u1", MFADetails: MFADetails{IsMFARegistered: true}}},
+		},
+		signInActivityResponse: deltaResponse[signInEntry]{
+			Value: []signInEntry{{ID: "u1", SignInActivity: &SignInActivityDetails{LastSignInDateTime: "2024-01-15T08:00:00Z"}}},
+		},
+	})
+	defer srv.Close()
+
+	cfg.EnrichWith = []string{"mfa", "sign_in_activity"}
+	p := NewWithClient(cfg, srv.Client())
+
+	for _, tc := range []struct {
+		name        string
+		full        bool
+		displayName string
+	}{
+		{name: "full", full: true, displayName: "Alice"},
+		{name: "incremental", full: false, displayName: "Alice Updated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore()
+			if !tc.full {
+				// Store the delta links that the incremental sync uses.
+				_ = collectDocs(t.Context(), t, p, store, true)
+			}
+			docs := collectDocs(t.Context(), t, p, store, tc.full)
+			if len(docs) != 1 {
+				t.Fatalf("got %d docs; want 1", len(docs))
+			}
+			doc := docs[0]
+			for k := range doc.Fields {
+				for other := range doc.Fields {
+					if strings.HasPrefix(other, k+".") {
+						t.Errorf("field %q is set next to its parent %q; the parent can overwrite it", other, k)
+					}
+				}
+			}
+			ad := azureAD(t, doc)
+			if got := ad["displayName"]; got != tc.displayName {
+				t.Errorf("azure_ad.displayName = %v; want %s", got, tc.displayName)
+			}
+			if m, ok := ad["mfa"].(*MFADetails); !ok || !m.IsMFARegistered {
+				t.Errorf("azure_ad.mfa = %#v; want registered MFA details", ad["mfa"])
+			}
+			if a, ok := ad["signInActivity"].(*SignInActivityDetails); !ok || a.LastSignInDateTime != "2024-01-15T08:00:00Z" {
+				t.Errorf("azure_ad.signInActivity = %#v; want last sign-in 2024-01-15T08:00:00Z", ad["signInActivity"])
+			}
+		})
+	}
+}
+
+func TestUserAzureADKeepsGraphFields(t *testing.T) {
+	u := userEntry{id: "u1", Fields: map[string]any{"displayName": "Alice"}}
+	mfa := map[string]*MFADetails{"u1": {IsMFARegistered: true}}
+	signIn := map[string]*SignInActivityDetails{"u1": {LastSignInDateTime: "2024-01-15T08:00:00Z"}}
+
+	got := userAzureAD(u, mfa, signIn)
+	if len(got) != 3 {
+		t.Errorf("userAzureAD returned %v; want displayName, mfa and signInActivity", got)
+	}
+	if len(u.Fields) != 1 {
+		t.Errorf("u.Fields = %v after userAzureAD; want it unchanged", u.Fields)
+	}
+}
+
+// azureAD returns the azure_ad map of doc.
+func azureAD(t *testing.T, doc entcollect.Document) map[string]any {
+	t.Helper()
+	ad, ok := doc.Fields["azure_ad"].(map[string]any)
+	if !ok {
+		t.Fatalf("azure_ad is %T; want map[string]any", doc.Fields["azure_ad"])
+	}
+	return ad
 }
 
 func TestPublisherError_StopsSync(t *testing.T) {

@@ -71,7 +71,9 @@ func (a Action) String() string {
 //
 // Fields contains nested, ECS-compatible data. Not all fields are
 // populated by all providers; absent fields are simply omitted
-// from the map.
+// from the map. Keys may be dotted paths. No key may be a dotted-path
+// prefix of another key, because adapters may expand keys in any order
+// and a parent key would replace the child's value.
 type Document struct {
 	ID        string
 	Kind      EntityKind
