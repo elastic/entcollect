@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -383,6 +385,73 @@ func TestIncrementalSync_PerUserGroups(t *testing.T) {
 	}
 }
 
+// TestFullSync_EnrichmentFailureIncomplete checks that an enrichment
+// request that keeps failing makes the sync report an IncompleteError,
+// while still publishing every user and saving the sync state.
+func TestFullSync_EnrichmentFailureIncomplete(t *testing.T) {
+	okta.SetFastRetry(t)
+	// A 403 is a lasting failure, such as a token without the scope; it is
+	// reported as incomplete too.
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusForbidden} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			testFullSyncEnrichmentFailureIncomplete(t, status)
+		})
+	}
+}
+
+func testFullSyncEnrichmentFailureIncomplete(t *testing.T, status int) {
+	now := time.Now()
+	fs := &fakeOktaServer{
+		users: []okta.User{
+			{ID: "u1", Status: "ACTIVE", LastUpdated: now},
+			{ID: "u2", Status: "ACTIVE", LastUpdated: now},
+		},
+		fail: map[string]int{
+			"/api/v1/users/u1/factors": status,
+		},
+	}
+
+	srv := httptest.NewTLSServer(fs.handler(t))
+	t.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+
+	cfg := okta.DefaultConfig()
+	cfg.Domain = u.Host
+	cfg.Token = "test-token"
+	cfg.LimitFixed = intPtr(1000)
+	cfg.Dataset = "users"
+	cfg.EnrichWith = []string{"factors"}
+
+	p := okta.NewWithClient(cfg, srv.Client())
+	store := newMemStore()
+	var docs []entcollect.Document
+	pub := func(_ context.Context, doc entcollect.Document) error {
+		docs = append(docs, doc)
+		return nil
+	}
+	log := slog.New(slog.NewTextHandler(newTestLogWriter(t), nil))
+
+	err = p.FullSync(t.Context(), store, pub, log)
+	var incomplete *entcollect.IncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("FullSync error = %v; want *entcollect.IncompleteError", err)
+	}
+	if !strings.Contains(err.Error(), "factors for user u1") {
+		t.Errorf("FullSync error = %q; want it to name the failed request", err)
+	}
+	if got := len(filterByKind(docs, entcollect.KindUser)); got != 2 {
+		t.Errorf("published %d users; want 2", got)
+	}
+	var cursor time.Time
+	if err := store.Get("okta.cursor.user.last_sync", &cursor); err != nil {
+		t.Errorf("user cursor not saved: %v", err)
+	}
+}
+
 func TestFullSync_EnrichmentSkipsDeletedEntities(t *testing.T) {
 	now := time.Now()
 	fs := &fakeOktaServer{
@@ -424,6 +493,8 @@ func TestFullSync_EnrichmentSkipsDeletedEntities(t *testing.T) {
 	p := okta.NewWithClient(cfg, srv.Client())
 	store := newMemStore()
 
+	// collectDocs fails the test on any error, so this also checks that a
+	// 404 does not make the sync incomplete.
 	docs := collectDocs(t.Context(), t, p, store, true)
 
 	userDocs := filterByKind(docs, entcollect.KindUser)
@@ -455,6 +526,76 @@ func TestFullSync_EnrichmentSkipsDeletedEntities(t *testing.T) {
 	}
 }
 
+func TestIncrementalSync_EnrichmentFailureIncomplete(t *testing.T) {
+	okta.SetFastRetry(t)
+	now := time.Now()
+	fs := &fakeOktaServer{
+		users: []okta.User{
+			{ID: "u1", Status: "ACTIVE", LastUpdated: now},
+			{ID: "u2", Status: "ACTIVE", LastUpdated: now},
+		},
+		groups:  []okta.Group{{ID: "g1", Profile: map[string]any{"name": "Engineering"}}},
+		members: map[string][]string{"g1": {"u1", "u2"}},
+		fail:    map[string]int{"/api/v1/users/u1/groups": http.StatusServiceUnavailable},
+	}
+
+	p, _ := newTestProvider(t, fs)
+	store := newMemStore()
+	var docs []entcollect.Document
+	pub := func(_ context.Context, doc entcollect.Document) error {
+		docs = append(docs, doc)
+		return nil
+	}
+	log := slog.New(slog.NewTextHandler(newTestLogWriter(t), nil))
+
+	err := p.IncrementalSync(t.Context(), store, pub, log)
+	var incomplete *entcollect.IncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("IncrementalSync error = %v; want *entcollect.IncompleteError", err)
+	}
+	if !strings.Contains(err.Error(), "groups for user u1") {
+		t.Errorf("IncrementalSync error = %q; want it to name the failed request", err)
+	}
+	if got := len(filterByKind(docs, entcollect.KindUser)); got != 2 {
+		t.Errorf("published %d users; want 2", got)
+	}
+	var cursor time.Time
+	if err := store.Get("okta.cursor.user.last_update", &cursor); err != nil {
+		t.Errorf("user cursor not saved: %v", err)
+	}
+}
+
+// TestIncrementalSync_GroupsRetryBudget checks that per-user groups
+// requests in an incremental sync share the enrichment retry budget.
+func TestIncrementalSync_GroupsRetryBudget(t *testing.T) {
+	okta.SetFastRetry(t)
+	now := time.Now()
+	const users = 30
+	fs := &fakeOktaServer{fail: map[string]int{}}
+	for i := range users {
+		id := fmt.Sprintf("u%d", i)
+		fs.users = append(fs.users, okta.User{ID: id, Status: "ACTIVE", LastUpdated: now})
+		fs.fail["/api/v1/users/"+id+"/groups"] = http.StatusServiceUnavailable
+	}
+	var groupRequests atomic.Int32
+	fs.onRequest = func(r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/groups") && strings.HasPrefix(r.URL.Path, "/api/v1/users/") {
+			groupRequests.Add(1)
+		}
+	}
+
+	p, _ := newTestProvider(t, fs)
+	pub := func(context.Context, entcollect.Document) error { return nil }
+	log := slog.New(slog.NewTextHandler(newTestLogWriter(t), nil))
+	err := p.IncrementalSync(t.Context(), newMemStore(), pub, log)
+	if !errors.As(err, new(*entcollect.IncompleteError)) {
+		t.Errorf("IncrementalSync error = %v; want *entcollect.IncompleteError", err)
+	}
+	if got, want := groupRequests.Load(), int32(users+20); got != want {
+		t.Errorf("got %d groups requests for %d users; want %d (one each plus the retry budget of 20)", got, users, want)
+	}
+}
+
 func TestIncrementalSync_GroupsEnrichmentSkipsDeletedUser(t *testing.T) {
 	now := time.Now()
 	fs := &fakeOktaServer{
@@ -472,6 +613,8 @@ func TestIncrementalSync_GroupsEnrichmentSkipsDeletedUser(t *testing.T) {
 	p, _ := newTestProvider(t, fs)
 	store := newMemStore()
 
+	// collectDocs fails the test on any error, so this also checks that a
+	// 404 does not make the sync incomplete.
 	docs := collectDocs(t.Context(), t, p, store, false)
 
 	userDocs := filterByKind(docs, entcollect.KindUser)
