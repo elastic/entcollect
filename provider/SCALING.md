@@ -216,5 +216,5 @@ modest for Elasticsearch.
 |----------|---------------|---------------------------|--------|
 | EntraID groups | `/groups/delta` + `members@delta` (incremental) | `GET /groups` + per-group `/members` (full refetch every active sync) | Minimal-state makes O(G) calls per active sync vs O(changed_groups) for legacy |
 | Okta groups | Per-user `/users/{id}/groups` (O(users)) | Bulk `/groups` + `/groups/{id}/members` (O(groups)) | Minimal-state is cheaper when groups < users |
-| AD | Same LDAP query pattern | Same | No difference |
+| AD | Same LDAP query pattern; unpaged unless `ad_paging_size` is set | Same; pages of 500 unless `ad_paging_size` is set | No difference in queries; legacy fails above Active Directory's MaxPageSize (1,000 by default) when unpaged |
 | Jamf | Same REST pattern | Same | No difference |

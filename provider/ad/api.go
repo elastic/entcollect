@@ -5,10 +5,12 @@
 package ad
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -151,7 +153,12 @@ func buildMemberOfFilter(groupDNs []string) string {
 // If since is non-zero, only records with whenChanged since that time are
 // returned. When a group has changed since that time, members of that group
 // are also re-fetched (Quirk 6: group-change re-emit).
-func GetDetails(query, url, user, pass string, base *ldap.DN, since time.Time, entityAttrs, grpAttrs []string, pagingSize uint32, dialer *net.Dialer, tlsconfig *tls.Config, entTyp string) ([]Entry, error) {
+//
+// The connection is closed when ctx is done, and the returned error then
+// wraps ctx.Err().
+func GetDetails(ctx context.Context, query, addr, user, pass string, base *ldap.DN, since time.Time, entityAttrs, grpAttrs []string, pagingSize uint32, dialer *net.Dialer, tlsconfig *tls.Config, entTyp string) (_ []Entry, err error) {
+	defer func() { err = withContextErr(ctx, err) }()
+
 	switch entTyp {
 	case "user", "device":
 	default:
@@ -161,23 +168,11 @@ func GetDetails(query, url, user, pass string, base *ldap.DN, since time.Time, e
 		return nil, fmt.Errorf("%w: no path", ErrInvalidDistinguishedName)
 	}
 
-	var opts []ldap.DialOpt
-	if dialer != nil {
-		opts = append(opts, ldap.DialWithDialer(dialer))
-	}
-	if tlsconfig != nil {
-		opts = append(opts, ldap.DialWithTLSConfig(tlsconfig))
-	}
-	conn, err := ldap.DialURL(url, opts...)
+	conn, release, err := connect(ctx, addr, user, pass, dialer, tlsconfig)
 	if err != nil {
 		return nil, err
 	}
-
-	err = conn.Bind(user, pass)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Unbind() //nolint:errcheck
+	defer release()
 
 	var errs []error
 
@@ -289,28 +284,21 @@ func GetDetails(query, url, user, pass string, base *ldap.DN, since time.Time, e
 
 // GetEmptyGroups returns groups that have no direct members. If since is
 // non-zero, only groups with whenChanged since that time are returned.
-func GetEmptyGroups(url, user, pass string, base *ldap.DN, since time.Time, grpAttrs []string, pagingSize uint32, dialer *net.Dialer, tlsconfig *tls.Config) ([]Entry, error) {
+//
+// The connection is closed when ctx is done, and the returned error then
+// wraps ctx.Err().
+func GetEmptyGroups(ctx context.Context, addr, user, pass string, base *ldap.DN, since time.Time, grpAttrs []string, pagingSize uint32, dialer *net.Dialer, tlsconfig *tls.Config) (_ []Entry, err error) {
+	defer func() { err = withContextErr(ctx, err) }()
+
 	if base == nil || len(base.RDNs) == 0 {
 		return nil, fmt.Errorf("%w: no path", ErrInvalidDistinguishedName)
 	}
 
-	var opts []ldap.DialOpt
-	if dialer != nil {
-		opts = append(opts, ldap.DialWithDialer(dialer))
-	}
-	if tlsconfig != nil {
-		opts = append(opts, ldap.DialWithTLSConfig(tlsconfig))
-	}
-	conn, err := ldap.DialURL(url, opts...)
+	conn, release, err := connect(ctx, addr, user, pass, dialer, tlsconfig)
 	if err != nil {
 		return nil, err
 	}
-
-	err = conn.Bind(user, pass)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Unbind() //nolint:errcheck
+	defer release()
 
 	parsed := parseBaseDN(base)
 	baseDN := parsed.originalBaseDN
@@ -338,6 +326,101 @@ func GetEmptyGroups(url, user, pass string, base *ldap.DN, since time.Time, grpA
 	}
 	return docs, nil
 }
+
+// withContextErr returns err wrapped with ctx.Err() if ctx is done, so
+// callers can tell that a failure was caused by cancellation.
+func withContextErr(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() == nil || errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ctx.Err(), err)
+}
+
+// connect dials addr and binds as user. Each request on the returned
+// connection times out after requestTimeout, and the connection is closed
+// when ctx is done. The caller must call release when it has finished with
+// the connection. The connection is closed if the bind fails, and no
+// connection is made if ctx is already done.
+func connect(ctx context.Context, addr, user, pass string, dialer *net.Dialer, tlsconfig *tls.Config) (conn *ldap.Conn, release func(), err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	conn, err = dial(ctx, addr, dialer, tlsconfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	conn.SetTimeout(requestTimeout)
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+
+	err = conn.Bind(user, pass)
+	if err != nil {
+		stop()
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	// Close without an unbind request. go-ldap never completes an
+	// unbind request, so with a request timeout set it would leave a
+	// goroutine waiting for the timeout after every connection.
+	return conn, func() {
+		stop()
+		_ = conn.Close()
+	}, nil
+}
+
+// dial connects to the LDAP server at rawURL and starts the connection.
+// It does what ldap.DialURL does, but the dial, and for ldaps the TLS
+// handshake, is cancelled when ctx is done. The dial is also bounded by the
+// dialer's timeout, which defaults to ldap.DefaultTimeout.
+func dial(ctx context.Context, rawURL string, dialer *net.Dialer, tlsconfig *tls.Config) (*ldap.Conn, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, ldap.NewError(ldap.ErrorNetwork, err)
+	}
+	if dialer == nil {
+		dialer = &net.Dialer{Timeout: ldap.DefaultTimeout}
+	}
+
+	var c net.Conn
+	switch u.Scheme {
+	case "ldapi":
+		path := u.Path
+		if path == "" || path == "/" {
+			path = "/var/run/slapd/ldapi"
+		}
+		c, err = dialer.DialContext(ctx, "unix", path)
+	case "cldap":
+		c, err = dialer.DialContext(ctx, "udp", hostPort(u, ldap.DefaultLdapPort))
+	case "ldap":
+		c, err = dialer.DialContext(ctx, "tcp", hostPort(u, ldap.DefaultLdapPort))
+	case "ldaps":
+		d := tls.Dialer{NetDialer: dialer, Config: tlsconfig}
+		c, err = d.DialContext(ctx, "tcp", hostPort(u, ldap.DefaultLdapsPort))
+	default:
+		err = fmt.Errorf("unknown scheme %q", u.Scheme)
+	}
+	if err != nil {
+		return nil, ldap.NewError(ldap.ErrorNetwork, err)
+	}
+
+	conn := ldap.NewConn(c, u.Scheme == "ldaps")
+	conn.Start()
+	return conn, nil
+}
+
+// hostPort returns the host and port of u, using port if u has none.
+func hostPort(u *url.URL, port string) string {
+	if p := u.Port(); p != "" {
+		port = p
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// requestTimeout bounds each LDAP request, including each page of a paged
+// search. It is longer than Active Directory's default MaxQueryDuration of
+// 120s, so with the default policy a query the server gives up on returns
+// the server's timeLimitExceeded error and not this timeout. It is a
+// variable so tests can shorten it.
+var requestTimeout = 3 * time.Minute
 
 func whenChanged(entity map[string]any, groups []any) time.Time {
 	l, _ := entity["whenChanged"].(time.Time)
@@ -368,11 +451,16 @@ func search(conn *ldap.Conn, base, filter string, attrs []string, pagingSize uin
 		Filter:       filter,
 		Attributes:   attrs,
 	}
-	if pagingSize != 0 {
-		return conn.SearchWithPaging(srch, pagingSize)
+	if pagingSize == 0 {
+		pagingSize = defaultPagingSize
 	}
-	return conn.Search(srch)
+	return conn.SearchWithPaging(srch, pagingSize)
 }
+
+// defaultPagingSize is the page size used when none is configured. Active
+// Directory rejects an unpaged search that matches more than its
+// MaxPageSize (1000 by default) entries.
+const defaultPagingSize = 500
 
 type entries map[string]map[string]any
 

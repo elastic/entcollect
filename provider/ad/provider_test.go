@@ -7,7 +7,9 @@ package ad_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strings"
@@ -550,6 +552,54 @@ func TestFullSync_ConfiguredAttrsHaveIDsAndCursor(t *testing.T) {
 	}
 	if cursor.IsZero() {
 		t.Error("cursor is zero; whenChanged should be mandatory")
+	}
+}
+
+// TestFullSync_Cancelled checks that cancelling a sync stops it while it
+// waits on a server that never answers.
+func TestFullSync_Cancelled(t *testing.T) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	read := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 512)
+		if _, err := conn.Read(buf); err != nil {
+			return
+		}
+		close(read)
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	p := newTestProvider(t, "ldap://"+ln.Addr().String())
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		pub := func(context.Context, entcollect.Document) error { return nil }
+		log := slog.New(slog.NewTextHandler(&testLogWriter{t}, nil))
+		done <- p.FullSync(ctx, newMemStore(), pub, log)
+	}()
+	select {
+	case <-read:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server received no request")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("FullSync error = %v; want it to wrap context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("FullSync did not return after cancellation")
 	}
 }
 
