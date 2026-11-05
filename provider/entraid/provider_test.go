@@ -524,7 +524,6 @@ func TestSync_EnrichmentInAzureAD(t *testing.T) {
 
 	cfg.EnrichWith = []string{"mfa", "sign_in_activity"}
 	p := NewWithClient(cfg, srv.Client())
-	store := newTestStore()
 
 	for _, tc := range []struct {
 		name        string
@@ -535,6 +534,11 @@ func TestSync_EnrichmentInAzureAD(t *testing.T) {
 		{name: "incremental", full: false, displayName: "Alice Updated"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore()
+			if !tc.full {
+				// Store the delta links that the incremental sync uses.
+				_ = collectDocs(t.Context(), t, p, store, true)
+			}
 			docs := collectDocs(t.Context(), t, p, store, tc.full)
 			if len(docs) != 1 {
 				t.Fatalf("got %d docs; want 1", len(docs))
@@ -558,6 +562,20 @@ func TestSync_EnrichmentInAzureAD(t *testing.T) {
 				t.Errorf("azure_ad.signInActivity = %#v; want last sign-in 2024-01-15T08:00:00Z", ad["signInActivity"])
 			}
 		})
+	}
+}
+
+func TestUserAzureADKeepsGraphFields(t *testing.T) {
+	u := userEntry{id: "u1", Fields: map[string]any{"displayName": "Alice"}}
+	mfa := map[string]*MFADetails{"u1": {IsMFARegistered: true}}
+	signIn := map[string]*SignInActivityDetails{"u1": {LastSignInDateTime: "2024-01-15T08:00:00Z"}}
+
+	got := userAzureAD(u, mfa, signIn)
+	if len(got) != 3 {
+		t.Errorf("userAzureAD returned %v; want displayName, mfa and signInActivity", got)
+	}
+	if len(u.Fields) != 1 {
+		t.Errorf("u.Fields = %v after userAzureAD; want it unchanged", u.Fields)
 	}
 }
 

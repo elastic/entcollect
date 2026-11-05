@@ -403,11 +403,9 @@ func (p *Provider) buildGraph(ctx context.Context, gc *graphClient) (membershipG
 
 // userAzureAD returns the azure_ad field of the document for u: its
 // Graph fields, with any MFA and sign-in activity enrichment for u added
-// as azure_ad.mfa and azure_ad.signInActivity. The legacy provider uses
-// the same paths, and the Entra ID integration reads them there. Keeping
-// one azure_ad map, instead of adding dotted keys next to it, means the
-// enrichment cannot be overwritten when the document's keys are expanded
-// in map order. u.Fields is not modified.
+// as mfa and signInActivity. Keeping one azure_ad map, instead of adding
+// dotted keys next to it, means the enrichment cannot be overwritten when
+// the document's keys are expanded in map order. u.Fields is not modified.
 func userAzureAD(u userEntry, mfa map[string]*MFADetails, signIn map[string]*SignInActivityDetails) map[string]any {
 	m, hasMFA := mfa[u.id]
 	s, hasSignIn := signIn[u.id]
