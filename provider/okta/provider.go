@@ -63,11 +63,13 @@ func New(cfg Config) *Provider {
 
 // NewWithClient returns a Provider using the given HTTP client as the
 // base transport. For OAuth2, the OAuth2 transport wraps this client.
-// A nil client uses http.DefaultClient.
+// A nil client uses http.DefaultClient. An https:// prefix on cfg.Domain,
+// in any letter case, is removed.
 func NewWithClient(cfg Config, client *http.Client) *Provider {
 	if client == nil {
 		client = http.DefaultClient
 	}
+	cfg.Domain = domainHost(cfg.Domain)
 	return &Provider{
 		cfg:          cfg,
 		client:       client,

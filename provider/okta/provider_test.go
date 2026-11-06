@@ -254,6 +254,32 @@ func TestFullSync_DatasetUsers(t *testing.T) {
 	}
 }
 
+func TestFullSync_DomainWithScheme(t *testing.T) {
+	now := time.Now()
+	fs := &fakeOktaServer{
+		users: []okta.User{{ID: "u1", Status: "ACTIVE", LastUpdated: now}},
+	}
+
+	srv := httptest.NewTLSServer(fs.handler(t))
+	t.Cleanup(srv.Close)
+
+	cfg := okta.DefaultConfig()
+	cfg.Domain = strings.Replace(srv.URL, "https://", "HTTPS://", 1)
+	cfg.Token = "test-token"
+	cfg.LimitFixed = intPtr(1000)
+	cfg.Dataset = "users"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with domain %q: %v", cfg.Domain, err)
+	}
+
+	p := okta.NewWithClient(cfg, srv.Client())
+	docs := collectDocs(t.Context(), t, p, newMemStore(), true)
+
+	if userDocs := filterByKind(docs, entcollect.KindUser); len(userDocs) != 1 {
+		t.Errorf("got %d user docs; want 1", len(userDocs))
+	}
+}
+
 func TestFullSync_DatasetDevices(t *testing.T) {
 	now := time.Now()
 	fs := &fakeOktaServer{
@@ -759,10 +785,25 @@ func TestIncrementalSync_NoIdsetOperations(t *testing.T) {
 }
 
 func TestConfig_Validate(t *testing.T) {
+	const (
+		errDomain   = "okta_domain must be a host name"
+		errTokenURL = "oauth2: token_url must be an absolute https URL"
+	)
+	oauth2 := func(tokenURL string) func(*okta.Config) {
+		return func(c *okta.Config) {
+			c.Token = ""
+			c.OAuth2 = &okta.OAuth2Config{
+				ClientID:     "client-id",
+				ClientSecret: "client-secret",
+				TokenURL:     tokenURL,
+				Scopes:       []string{"okta.users.read"},
+			}
+		}
+	}
 	tests := []struct {
 		name    string
 		modify  func(*okta.Config)
-		wantErr bool
+		wantErr string
 	}{
 		{
 			name:   "valid with token",
@@ -771,44 +812,172 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name:    "missing domain",
 			modify:  func(c *okta.Config) { c.Domain = "" },
-			wantErr: true,
+			wantErr: "okta_domain is required",
+		},
+		{
+			name:   "domain_https",
+			modify: func(c *okta.Config) { c.Domain = "https://example.okta.com" },
+		},
+		{
+			name:   "domain_https_upper_case",
+			modify: func(c *okta.Config) { c.Domain = "HTTPS://example.okta.com" },
+		},
+		{
+			name:   "domain_port",
+			modify: func(c *okta.Config) { c.Domain = "example.okta.com:8443" },
+		},
+		{
+			name:   "domain_max_port",
+			modify: func(c *okta.Config) { c.Domain = "example.okta.com:65535" },
+		},
+		{
+			name:   "domain_ipv6",
+			modify: func(c *okta.Config) { c.Domain = "[::1]" },
+		},
+		{
+			name:   "domain_ipv6_with_port",
+			modify: func(c *okta.Config) { c.Domain = "[::1]:8443" },
+		},
+		{
+			name:    "domain_http",
+			modify:  func(c *okta.Config) { c.Domain = "http://example.okta.com" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_https_only",
+			modify:  func(c *okta.Config) { c.Domain = "https://" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_port_only",
+			modify:  func(c *okta.Config) { c.Domain = ":8443" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_empty_port",
+			modify:  func(c *okta.Config) { c.Domain = "example.okta.com:" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_zero_port",
+			modify:  func(c *okta.Config) { c.Domain = "example.okta.com:0" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_port_out_of_range",
+			modify:  func(c *okta.Config) { c.Domain = "example.okta.com:65536" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_ipv6_unbracketed",
+			modify:  func(c *okta.Config) { c.Domain = "2001:db8::1" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_space",
+			modify:  func(c *okta.Config) { c.Domain = "example okta.com" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_trailing_slash",
+			modify:  func(c *okta.Config) { c.Domain = "https://example.okta.com/" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_path",
+			modify:  func(c *okta.Config) { c.Domain = "example.okta.com/api" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_user_info",
+			modify:  func(c *okta.Config) { c.Domain = "user@example.okta.com" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_query",
+			modify:  func(c *okta.Config) { c.Domain = "example.okta.com?x=1" },
+			wantErr: errDomain,
+		},
+		{
+			name:    "domain_double_scheme",
+			modify:  func(c *okta.Config) { c.Domain = "https://https://example.okta.com" },
+			wantErr: errDomain,
 		},
 		{
 			name:    "no auth",
 			modify:  func(c *okta.Config) { c.Token = "" },
-			wantErr: true,
+			wantErr: "exactly one of okta_token or oauth2 is required",
+		},
+		{
+			name:   "zero_batch_size",
+			modify: func(c *okta.Config) { c.BatchSize = 0 },
+		},
+		{
+			name:    "negative_batch_size",
+			modify:  func(c *okta.Config) { c.BatchSize = -1 },
+			wantErr: "batch_size must not be negative",
+		},
+		{
+			name:   "one_shard",
+			modify: func(c *okta.Config) { c.IDSetShards = 1 },
+		},
+		{
+			name:    "zero_shards",
+			modify:  func(c *okta.Config) { c.IDSetShards = 0 },
+			wantErr: "idset_shards must be at least 1",
+		},
+		{
+			name:    "negative_shards",
+			modify:  func(c *okta.Config) { c.IDSetShards = -1 },
+			wantErr: "idset_shards must be at least 1",
+		},
+		{
+			name:    "zero_limit_window",
+			modify:  func(c *okta.Config) { c.LimitWindow = 0 },
+			wantErr: "limit_window must be positive",
+		},
+		{
+			name:    "negative_limit_window",
+			modify:  func(c *okta.Config) { c.LimitWindow = -time.Minute },
+			wantErr: "limit_window must be positive",
+		},
+		{
+			name:   "one_limit_fixed",
+			modify: func(c *okta.Config) { c.LimitFixed = intPtr(1) },
+		},
+		{
+			name:    "zero_limit_fixed",
+			modify:  func(c *okta.Config) { c.LimitFixed = intPtr(0) },
+			wantErr: "limit_fixed must be positive if set",
+		},
+		{
+			name:    "negative_limit_fixed",
+			modify:  func(c *okta.Config) { c.LimitFixed = intPtr(-1) },
+			wantErr: "limit_fixed must be positive if set",
 		},
 		{
 			name:    "both auth",
 			modify:  func(c *okta.Config) { c.OAuth2 = &okta.OAuth2Config{} },
-			wantErr: true,
+			wantErr: "cannot specify both okta_token and oauth2",
 		},
 		{
 			name:    "invalid dataset",
 			modify:  func(c *okta.Config) { c.Dataset = "invalid" },
-			wantErr: true,
+			wantErr: "dataset must be",
 		},
 		{
 			name:    "invalid enrichment",
 			modify:  func(c *okta.Config) { c.EnrichWith = []string{"bogus"} },
-			wantErr: true,
+			wantErr: "unknown enrich_with value",
 		},
 		{
 			name:    "sync <= update",
 			modify:  func(c *okta.Config) { c.SyncInterval = c.UpdateInterval },
-			wantErr: true,
+			wantErr: "sync_interval must be greater than update_interval",
 		},
 		{
-			name: "valid oauth2 with secret",
-			modify: func(c *okta.Config) {
-				c.Token = ""
-				c.OAuth2 = &okta.OAuth2Config{
-					ClientID:     "client-id",
-					ClientSecret: "client-secret",
-					TokenURL:     "https://example.okta.com/oauth2/v1/token",
-					Scopes:       []string{"okta.users.read"},
-				}
-			},
+			name:   "valid oauth2 with secret",
+			modify: oauth2("https://example.okta.com/oauth2/v1/token"),
 		},
 		{
 			name: "valid oauth2 with jwk",
@@ -823,6 +992,30 @@ func TestConfig_Validate(t *testing.T) {
 			},
 		},
 		{
+			name:   "oauth2_token_url_upper_case_scheme",
+			modify: oauth2("HTTPS://example.okta.com/oauth2/v1/token"),
+		},
+		{
+			name:    "oauth2_token_url_no_scheme",
+			modify:  oauth2("example.okta.com/oauth2/v1/token"),
+			wantErr: errTokenURL,
+		},
+		{
+			name:    "oauth2_token_url_http",
+			modify:  oauth2("http://example.okta.com/oauth2/v1/token"),
+			wantErr: errTokenURL,
+		},
+		{
+			name:    "oauth2_token_url_no_host",
+			modify:  oauth2("https:///oauth2/v1/token"),
+			wantErr: errTokenURL,
+		},
+		{
+			name:    "oauth2_token_url_unparsable",
+			modify:  oauth2("https://example.okta.com:port/oauth2/v1/token"),
+			wantErr: errTokenURL,
+		},
+		{
 			name: "oauth2 missing client_id",
 			modify: func(c *okta.Config) {
 				c.Token = ""
@@ -832,19 +1025,12 @@ func TestConfig_Validate(t *testing.T) {
 					Scopes:       []string{"okta.users.read"},
 				}
 			},
-			wantErr: true,
+			wantErr: "oauth2: client_id is required",
 		},
 		{
-			name: "oauth2 missing token_url",
-			modify: func(c *okta.Config) {
-				c.Token = ""
-				c.OAuth2 = &okta.OAuth2Config{
-					ClientID:     "client-id",
-					ClientSecret: "secret",
-					Scopes:       []string{"okta.users.read"},
-				}
-			},
-			wantErr: true,
+			name:    "oauth2 missing token_url",
+			modify:  oauth2(""),
+			wantErr: "oauth2: token_url is required",
 		},
 		{
 			name: "oauth2 missing scopes",
@@ -856,7 +1042,7 @@ func TestConfig_Validate(t *testing.T) {
 					TokenURL:     "https://example.okta.com/oauth2/v1/token",
 				}
 			},
-			wantErr: true,
+			wantErr: "oauth2: scopes is required",
 		},
 		{
 			name: "oauth2 no credentials",
@@ -868,7 +1054,7 @@ func TestConfig_Validate(t *testing.T) {
 					Scopes:   []string{"okta.users.read"},
 				}
 			},
-			wantErr: true,
+			wantErr: "oauth2: exactly one of client_secret or jwk is required",
 		},
 		{
 			name: "oauth2 both credentials",
@@ -882,7 +1068,7 @@ func TestConfig_Validate(t *testing.T) {
 					JWK:          []byte(`{"kty":"RSA"}`),
 				}
 			},
-			wantErr: true,
+			wantErr: "oauth2: cannot specify both client_secret and jwk",
 		},
 	}
 
@@ -893,8 +1079,13 @@ func TestConfig_Validate(t *testing.T) {
 			cfg.Token = "test-token"
 			tt.modify(&cfg)
 			err := cfg.Validate()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Validate() error = %v; wantErr = %v", err, tt.wantErr)
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("Validate() = %v; want nil", err)
+			case tt.wantErr != "" && err == nil:
+				t.Errorf("Validate() = nil; want error containing %q", tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Errorf("Validate() = %v; want error containing %q", err, tt.wantErr)
 			}
 		})
 	}

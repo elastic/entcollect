@@ -37,6 +37,8 @@ type Config struct {
 	// (defaultPagingSize).
 	PagingSize uint32 `json:"ad_paging_size"`
 
+	// IDSetShards is the number of shards in each ID set. It must be at
+	// least 1.
 	IDSetShards    int           `json:"idset_shards"`
 	SyncInterval   time.Duration `json:"sync_interval"`
 	UpdateInterval time.Duration `json:"update_interval"`
@@ -61,6 +63,7 @@ var (
 	errMissingBaseDN   = errors.New("ad_base_dn is required")
 	errMissingUser     = errors.New("ad_user is required")
 	errMissingPassword = errors.New("ad_password is required")
+	errInvalidShards   = errors.New("idset_shards must be at least 1")
 	errInvalidSync     = errors.New("sync_interval must be positive")
 	errInvalidUpdate   = errors.New("update_interval must be positive")
 	errSyncNotLonger   = errors.New("sync_interval must be greater than update_interval")
@@ -77,6 +80,8 @@ func (c *Config) Validate() error {
 		return errMissingUser
 	case c.Password == "":
 		return errMissingPassword
+	case c.IDSetShards < 1:
+		return errInvalidShards
 	case c.SyncInterval <= 0:
 		return errInvalidSync
 	case c.UpdateInterval <= 0:
