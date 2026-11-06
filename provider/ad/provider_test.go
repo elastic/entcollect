@@ -477,6 +477,9 @@ func TestConfigValidation(t *testing.T) {
 		{"missing BaseDN", func(c *ad.Config) { c.BaseDN = "" }, "ad_base_dn is required"},
 		{"missing User", func(c *ad.Config) { c.User = "" }, "ad_user is required"},
 		{"missing Password", func(c *ad.Config) { c.Password = "" }, "ad_password is required"},
+		{"one_shard", func(c *ad.Config) { c.IDSetShards = 1 }, ""},
+		{"zero_shards", func(c *ad.Config) { c.IDSetShards = 0 }, "idset_shards must be at least 1"},
+		{"negative_shards", func(c *ad.Config) { c.IDSetShards = -1 }, "idset_shards must be at least 1"},
 		{"bad dataset", func(c *ad.Config) { c.Dataset = "invalid" }, "dataset must be"},
 		{"bad sync interval", func(c *ad.Config) { c.SyncInterval = 0 }, "sync_interval must be positive"},
 		{"bad update interval", func(c *ad.Config) { c.UpdateInterval = 0 }, "update_interval must be positive"},
@@ -493,6 +496,12 @@ func TestConfigValidation(t *testing.T) {
 			test.modify(&cfg)
 
 			err := cfg.Validate()
+			if test.wantErr == "" {
+				if err != nil {
+					t.Errorf("unexpected validation error: %v", err)
+				}
+				return
+			}
 			if err == nil {
 				t.Fatal("expected validation error")
 			}

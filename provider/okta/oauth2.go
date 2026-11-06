@@ -47,6 +47,8 @@ func (o *OAuth2Config) validate() error {
 		return errOAuth2MissingClientID
 	case o.TokenURL == "":
 		return errOAuth2MissingTokenURL
+	case !validTokenURL(o.TokenURL):
+		return errOAuth2InvalidTokenURL
 	case len(o.Scopes) == 0:
 		return errOAuth2MissingScopes
 	case o.ClientSecret == "" && len(o.JWK) == 0:
@@ -55,6 +57,15 @@ func (o *OAuth2Config) validate() error {
 		return errOAuth2BothCreds
 	}
 	return nil
+}
+
+// validTokenURL reports whether s is an absolute https URL with a host.
+// A token URL built from a domain without a scheme, such as
+// example.okta.com/oauth2/v1/token, would otherwise fail every token
+// request.
+func validTokenURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "https" && u.Hostname() != ""
 }
 
 // newOAuth2Client creates an HTTP client with an OAuth2 transport.
