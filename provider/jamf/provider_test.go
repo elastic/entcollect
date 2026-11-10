@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -381,7 +382,7 @@ type fakeServer struct {
 	requests  atomic.Int64
 }
 
-func (fs *fakeServer) resetRequests()     { fs.requests.Store(0) }
+func (fs *fakeServer) resetRequests()      { fs.requests.Store(0) }
 func (fs *fakeServer) requestCount() int64 { return fs.requests.Load() }
 
 func (fs *fakeServer) handler(tb testing.TB) http.Handler {
@@ -513,4 +514,55 @@ func docFieldsBytes(docs []entcollect.Document) int {
 		total += len(b)
 	}
 	return total
+}
+
+func TestConfigValidate(t *testing.T) {
+	valid := func() jamf.Config {
+		cfg := jamf.DefaultConfig()
+		cfg.TenantID = "example.jamfcloud.com"
+		cfg.Username = "user"
+		cfg.Password = "pass"
+		return cfg
+	}
+	tests := []struct {
+		name    string
+		modify  func(*jamf.Config)
+		wantErr string
+	}{
+		{name: "defaults", modify: func(*jamf.Config) {}},
+		{name: "tenant_with_port", modify: func(c *jamf.Config) { c.TenantID = "127.0.0.1:8443" }},
+		{name: "zero_page_size", modify: func(c *jamf.Config) { c.PageSize = 0 }},
+		{name: "zero_token_grace", modify: func(c *jamf.Config) { c.TokenGrace = 0 }},
+		{name: "one_shard", modify: func(c *jamf.Config) { c.IDSetShards = 1 }},
+		{name: "tenant_ipv6", modify: func(c *jamf.Config) { c.TenantID = "[2001:db8::1]" }},
+		{name: "tenant_ipv6_with_port", modify: func(c *jamf.Config) { c.TenantID = "[::1]:8443" }},
+		{name: "tenant_max_port", modify: func(c *jamf.Config) { c.TenantID = "example.jamfcloud.com:65535" }},
+		{name: "tenant_empty_port", modify: func(c *jamf.Config) { c.TenantID = "example.jamfcloud.com:" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_zero_port", modify: func(c *jamf.Config) { c.TenantID = "example.jamfcloud.com:0" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_port_out_of_range", modify: func(c *jamf.Config) { c.TenantID = "example.jamfcloud.com:65536" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_ipv6_unbracketed", modify: func(c *jamf.Config) { c.TenantID = "2001:db8::1" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "missing_tenant", modify: func(c *jamf.Config) { c.TenantID = "" }, wantErr: "jamf_tenant is required"},
+		{name: "tenant_with_scheme", modify: func(c *jamf.Config) { c.TenantID = "https://example.jamfcloud.com" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_with_path", modify: func(c *jamf.Config) { c.TenantID = "example.jamfcloud.com/api" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_with_user", modify: func(c *jamf.Config) { c.TenantID = "user@example.jamfcloud.com" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_with_query", modify: func(c *jamf.Config) { c.TenantID = "example.jamfcloud.com?a=b" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_port_only", modify: func(c *jamf.Config) { c.TenantID = ":8443" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "tenant_with_space", modify: func(c *jamf.Config) { c.TenantID = "example jamfcloud.com" }, wantErr: "jamf_tenant must be only a host"},
+		{name: "negative_page_size", modify: func(c *jamf.Config) { c.PageSize = -1 }, wantErr: "page_size must not be negative"},
+		{name: "zero_shards", modify: func(c *jamf.Config) { c.IDSetShards = 0 }, wantErr: "idset_shards must be at least 1"},
+		{name: "negative_token_grace", modify: func(c *jamf.Config) { c.TokenGrace = -time.Second }, wantErr: "token_grace_period must not be negative"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := valid()
+			test.modify(&cfg)
+			err := cfg.Validate()
+			switch {
+			case test.wantErr == "" && err != nil:
+				t.Errorf("Validate() = %v; want nil", err)
+			case test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)):
+				t.Errorf("Validate() = %v; want error containing %q", err, test.wantErr)
+			}
+		})
+	}
 }
