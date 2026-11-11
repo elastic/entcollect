@@ -232,24 +232,50 @@ func TestDoHonoursRetryAfter(t *testing.T) {
 }
 
 // TestDoServerErrorRetryAfter checks that a 5xx response's Retry-After
-// lengthens the backoff, up to MaxDelay.
+// lengthens the backoff, up to MaxDelay, including when MaxDelay is not
+// set.
 func TestDoServerErrorRetryAfter(t *testing.T) {
-	p := Policy{Attempts: 2, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Second}
+	for _, maxDelay := range []time.Duration{5 * time.Second, 0} {
+		t.Run(fmt.Sprintf("max_delay_%v", maxDelay), func(t *testing.T) {
+			p := Policy{Attempts: 2, BaseDelay: time.Millisecond, MaxDelay: maxDelay}
+			var calls atomic.Int32
+			start := time.Now()
+			_, err := Do(t.Context(), p, slog.New(slog.DiscardHandler), func(context.Context) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					resp := fakeResponse(http.StatusServiceUnavailable, "unavailable")
+					resp.Header.Set("Retry-After", "1")
+					return resp, nil
+				}
+				return fakeResponse(http.StatusOK, "[]"), nil
+			})
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			if d := time.Since(start); d < time.Second {
+				t.Errorf("retried after %v; want at least the 1s Retry-After", d)
+			}
+		})
+	}
+}
+
+// TestDoBacksOffWithoutMaxDelay checks that a Policy with no MaxDelay
+// still waits BaseDelay before retrying.
+func TestDoBacksOffWithoutMaxDelay(t *testing.T) {
+	const base = 100 * time.Millisecond
+	p := Policy{Attempts: 2, BaseDelay: base}
 	var calls atomic.Int32
 	start := time.Now()
 	_, err := Do(t.Context(), p, slog.New(slog.DiscardHandler), func(context.Context) (*http.Response, error) {
 		if calls.Add(1) == 1 {
-			resp := fakeResponse(http.StatusServiceUnavailable, "unavailable")
-			resp.Header.Set("Retry-After", "1")
-			return resp, nil
+			return fakeResponse(http.StatusServiceUnavailable, "unavailable"), nil
 		}
 		return fakeResponse(http.StatusOK, "[]"), nil
 	})
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	if d := time.Since(start); d < time.Second {
-		t.Errorf("retried after %v; want at least the 1s Retry-After", d)
+	if d := time.Since(start); d < base {
+		t.Errorf("retried after %v; want at least the %v BaseDelay", d, base)
 	}
 }
 

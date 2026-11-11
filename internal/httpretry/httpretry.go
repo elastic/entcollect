@@ -50,7 +50,8 @@ type Policy struct {
 	BaseDelay time.Duration
 	// MaxDelay caps the wait between attempts, including a wait
 	// requested by a 5xx response's Retry-After header. It does not cap
-	// the wait after a 429 response (see MaxPaced).
+	// the wait after a 429 response (see MaxPaced). Zero or less means
+	// 30 minutes, the longest wait Do takes for a 429's Retry-After.
 	MaxDelay time.Duration
 	// Budget, if not nil, limits the retries made by all the calls that
 	// share it. When it is spent, a failed attempt is not retried.
@@ -177,6 +178,9 @@ func Do(ctx context.Context, p Policy, log *slog.Logger, send func(context.Conte
 	maxPaced := p.MaxPaced
 	if maxPaced == 0 {
 		maxPaced = defaultMaxPaced
+	}
+	if p.MaxDelay <= 0 {
+		p.MaxDelay = maxPaceWait
 	}
 	var (
 		lastErr    error
@@ -325,7 +329,8 @@ func retryAfterWait(h http.Header, now time.Time) time.Duration {
 	return min(parseRetryAfter(h.Get("Retry-After"), now), maxPaceWait)
 }
 
-// maxPaceWait caps a wait asked for by a Retry-After header.
+// maxPaceWait caps a wait asked for by a 429's Retry-After header. It is
+// also the cap on other waits when Policy.MaxDelay is not set.
 const maxPaceWait = 30 * time.Minute
 
 // statusError returns an error for a retried response with the given
