@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -333,6 +334,42 @@ func TestFullSync_DeviceDeletion(t *testing.T) {
 	}
 	if ids["d2"] != entcollect.ActionDeleted {
 		t.Errorf("d2 Action = %v; want ActionDeleted", ids["d2"])
+	}
+}
+
+// TestDeviceDeletedDuringSync checks that a device deleted between the
+// device listing and its users request, which then returns 404, is
+// skipped and does not end the sync.
+func TestDeviceDeletedDuringSync(t *testing.T) {
+	fs := &fakeOktaServer{
+		devices: []okta.Device{
+			{ID: "d1", Status: "ACTIVE"},
+			{ID: "d2", Status: "ACTIVE"},
+		},
+		devUsers: map[string][]okta.User{},
+	}
+	p, _ := newTestProvider(t, fs)
+	store := newMemStore()
+
+	collectDocs(t.Context(), t, p, store, true)
+
+	fs.fail = map[string]int{"/api/v1/devices/d2/users": http.StatusNotFound}
+	for _, full := range []bool{false, true} {
+		// collectDocs fails the test if the sync returns an error.
+		docs := collectDocs(t.Context(), t, p, store, full)
+		got := make(map[string]entcollect.Action, len(docs))
+		for _, d := range filterByKind(docs, entcollect.KindDevice) {
+			got[d.ID] = d.Action
+		}
+		want := map[string]entcollect.Action{"d1": entcollect.ActionModified}
+		if full {
+			// The full sync reports the deletion of a device an earlier
+			// sync saw.
+			want["d2"] = entcollect.ActionDeleted
+		}
+		if !maps.Equal(got, want) {
+			t.Errorf("full=%t: device actions = %v; want %v", full, got, want)
+		}
 	}
 }
 

@@ -195,17 +195,23 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		var latestDevice time.Time
 		for i := range allDevices {
 			d := &allDevices[i]
-			devices.Add(d.ID)
-
 			if d.LastUpdated.After(latestDevice) {
 				latestDevice = d.LastUpdated
 			}
 
 			devUsers, _, err := getDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
+			if errors.As(err, new(notFoundError)) {
+				// The device was deleted after it was listed. Leaving it
+				// out of the set reports its deletion below if an earlier
+				// sync saw it.
+				log.Info("device deleted during sync, skipping", "device", d.ID)
+				continue
+			}
 			if err != nil {
 				return fmt.Errorf("okta: get device users for %s: %w", d.ID, err)
 			}
 			d.Users = devUsers
+			devices.Add(d.ID)
 
 			action := entcollect.ActionDiscovered
 			if devices.WasPresent(d.ID) {
@@ -354,6 +360,12 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 				latestDevice = d.LastUpdated
 			}
 			devUsers, _, err := getDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
+			if errors.As(err, new(notFoundError)) {
+				// The device was deleted after it was listed. The next
+				// full sync reports its deletion.
+				log.Info("device deleted during sync, skipping", "device", d.ID)
+				continue
+			}
 			if err != nil {
 				return fmt.Errorf("okta: get device users for %s: %w", d.ID, err)
 			}
