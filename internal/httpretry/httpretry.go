@@ -100,8 +100,8 @@ type Budget struct {
 }
 
 // NewBudget returns a Budget that allows limit retries within any period
-// of window. A limit of zero or less allows no retries; a window of zero or
-// less allows any number.
+// of window. A limit of zero or less allows no retries, whatever the
+// window. Otherwise, a window of zero or less allows any number.
 func NewBudget(limit int, window time.Duration) *Budget {
 	return &Budget{limit: limit, window: window}
 }

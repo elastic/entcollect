@@ -572,6 +572,24 @@ func TestBudget(t *testing.T) {
 	if !nilBudget.take(start) {
 		t.Error("nil Budget refused a retry")
 	}
+
+	for _, tc := range []struct {
+		limit  int
+		window time.Duration
+		want   bool
+	}{
+		{limit: 1, window: 0, want: true},
+		{limit: 1, window: -time.Minute, want: true},
+		{limit: 0, window: 0, want: false},
+		{limit: 0, window: time.Minute, want: false},
+	} {
+		b := NewBudget(tc.limit, tc.window)
+		for i := range 3 {
+			if got := b.take(start); got != tc.want {
+				t.Errorf("NewBudget(%d, %v): take %d = %t; want %t", tc.limit, tc.window, i, got, tc.want)
+			}
+		}
+	}
 }
 
 func TestDoBudgetExhausted(t *testing.T) {
