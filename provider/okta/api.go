@@ -399,7 +399,7 @@ func doRequest(ctx context.Context, cli *http.Client, u *url.URL, endpoint, key 
 	log = log.With("url", target)
 	policy := retryPolicy
 	policy.Budget = budget
-	policy.Pacer = resetPacer{log: log}
+	policy.Pacer = resetPacer{}
 	resp, err := httpretry.Do(ctx, policy, log, func(ctx context.Context) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
@@ -441,26 +441,15 @@ func doRequest(ctx context.Context, cli *http.Client, u *url.URL, endpoint, key 
 	return resp.Body, resp.Header, nil
 }
 
-// resetPacer waits after a 429 response until the rate limit resets, at
-// the time given by Okta's X-Rate-Limit-Reset header. It keeps no state
-// between requests: once the limit has reset, later requests need not
-// wait for it again.
-type resetPacer struct {
-	log *slog.Logger
-}
+// resetPacer makes Do wait after a 429 response until the rate limit
+// resets, at the time given by Okta's X-Rate-Limit-Reset header. It keeps
+// no state between requests: once the limit has reset, later requests
+// need not wait for it again.
+type resetPacer struct{}
 
-func (p resetPacer) Wait(ctx context.Context, resp *http.Response) (bool, error) {
+func (resetPacer) Delay(resp *http.Response) (time.Duration, bool) {
 	d := resetWait(resp.Header, time.Now())
-	if d <= 0 {
-		return false, nil
-	}
-	p.log.Info("rate limited, waiting for the limit to reset", "wait", d)
-	select {
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case <-time.After(d):
-		return true, nil
-	}
+	return d, d > 0
 }
 
 // resetWait returns how long to wait, from now, for the rate limit reset

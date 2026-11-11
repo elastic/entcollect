@@ -49,15 +49,16 @@ type Policy struct {
 	// each further attempt.
 	BaseDelay time.Duration
 	// MaxDelay caps the wait between attempts, including a wait
-	// requested by a 5xx response's Retry-After header. It does not cap
-	// the wait after a 429 response (see MaxPaced). Zero or less means
-	// 30 minutes, the longest wait Do takes for a 429's Retry-After.
+	// requested by a Retry-After header on a response handled as a failed
+	// attempt. It does not cap the wait before a paced retry after a 429
+	// response (see MaxPaced). Zero or less means 30 minutes, the longest
+	// wait Do takes before a paced retry.
 	MaxDelay time.Duration
 	// Budget, if not nil, limits the retries made by all the calls that
 	// share it. When it is spent, a failed attempt is not retried.
 	Budget *Budget
-	// Pacer, if not nil, waits after a 429 response whose Retry-After
-	// header is missing or gives no wait.
+	// Pacer, if not nil, sets the wait after a 429 response whose
+	// Retry-After header is missing or gives no wait.
 	Pacer Pacer
 	// MaxPaced is the most paced retries Do makes in one call: retries
 	// after a 429 response, waiting as its Retry-After header or the
@@ -70,18 +71,17 @@ type Policy struct {
 // zero.
 const defaultMaxPaced = 10
 
-// Pacer waits after a 429 response until the request may be sent again.
-// Servers signal how long to wait in many different ways, so a Pacer
-// holds the knowledge of a particular server. Do limits how many times it
-// paces one call (Policy.MaxPaced), so a Pacer need not, and one Pacer can
-// be shared by concurrent calls if its Wait is safe for concurrent use.
+// Pacer decides how long to wait after a 429 response before the request
+// may be sent again. Servers signal how long to wait in many different
+// ways, so a Pacer holds the knowledge of a particular server. Do does
+// the waiting, caps the wait at 30 minutes, and limits how many times it
+// paces one call (Policy.MaxPaced), so a Pacer need not. One Pacer can be
+// shared by concurrent calls if its Delay is safe for concurrent use.
 type Pacer interface {
-	// Wait blocks until the request may be sent again after resp, a 429
-	// response whose body has been read and closed, or until ctx is done.
-	// It reports false if it cannot tell how long to wait, and Do then
-	// treats the 429 as a failed attempt. A Pacer should not wait for
-	// unreasonably long, whatever resp says.
-	Wait(ctx context.Context, resp *http.Response) (bool, error)
+	// Delay returns how long to wait after resp, a 429 response whose
+	// body has been read and closed. It reports false if it cannot tell,
+	// and Do then treats the 429 as a failed attempt.
+	Delay(resp *http.Response) (time.Duration, bool)
 }
 
 // Budget limits the number of retries across calls to Do: at most limit
@@ -171,8 +171,7 @@ func (e permanentError) Unwrap() error { return e.err }
 //
 // If ctx is done, Do returns an error that wraps ctx.Err(). If all
 // attempts fail, or a retry is needed but p.Budget is spent, it returns an
-// *Error; in the second case the error wraps ErrBudgetExhausted. If the
-// Pacer fails, Do returns an error that wraps the Pacer's error.
+// *Error; in the second case the error wraps ErrBudgetExhausted.
 func Do(ctx context.Context, p Policy, log *slog.Logger, send func(context.Context) (*http.Response, error)) (*Response, error) {
 	attempts := max(p.Attempts, 1)
 	maxPaced := p.MaxPaced
@@ -182,89 +181,105 @@ func Do(ctx context.Context, p Policy, log *slog.Logger, send func(context.Conte
 	if p.MaxDelay <= 0 {
 		p.MaxDelay = maxPaceWait
 	}
-	var (
-		lastErr    error
-		lastStatus int
-		retryAfter time.Duration
-		paced      int
-	)
-	for attempt := range attempts {
-		if attempt > 0 {
-			if ctx.Err() != nil {
-				return nil, withContext(ctx, lastErr)
-			}
-			if !p.Budget.take(time.Now()) {
-				return nil, &Error{Attempts: attempt, StatusCode: lastStatus, Err: fmt.Errorf("%w: %w", ErrBudgetExhausted, lastErr)}
-			}
-			d := max(backoff(attempt, p), min(retryAfter, p.MaxDelay))
-			log.Warn("retrying request", "retry", attempt, "max", attempts, "backoff", d, "status", lastStatus, "error", lastErr)
-			select {
-			case <-ctx.Done():
-				return nil, withContext(ctx, lastErr)
-			case <-time.After(d):
-			}
-		}
-
-		resp, err := send(ctx)
-		// Paced retries: the server sets the wait, so they are not
-		// counted as attempts.
-		for err == nil && resp.StatusCode == http.StatusTooManyRequests && paced < maxPaced {
-			body := readExcerpt(resp)
-			ok, perr := pace(ctx, p.Pacer, resp, log)
-			if perr != nil {
-				if ctx.Err() != nil {
-					return nil, withContext(ctx, statusError(resp.Status, body))
-				}
-				return nil, fmt.Errorf("pacing after %s: %w", resp.Status, perr)
-			}
-			if !ok {
-				// Handled below as a failed attempt.
-				resp.Body = io.NopCloser(bytes.NewReader(body))
-				break
-			}
-			paced++
-			resp, err = send(ctx)
-		}
-		if err != nil {
-			var perm permanentError
-			if errors.As(err, &perm) {
-				return nil, perm.err
-			}
-			if ctx.Err() != nil {
-				return nil, withContext(ctx, err)
-			}
-			if isUnrecoverable(err) {
-				return nil, err
-			}
-			lastErr, lastStatus, retryAfter = err, 0, 0
-			continue
-		}
-
-		lastStatus, retryAfter = resp.StatusCode, 0
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			lastErr = statusError(resp.Status, readExcerpt(resp))
-			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
-			continue
-		}
-
-		var body bytes.Buffer
-		_, err = io.Copy(&body, resp.Body)
-		resp.Body.Close()
+	var failed, paced int
+	for {
+		o := classify(send(ctx))
 		switch {
-		case err != nil:
-			// If ctx is done, the wait before the next attempt, or the
-			// check after the last, returns it.
-			lastErr = fmt.Errorf("%s: read body: %w", resp.Status, err)
-		case body.Len() == 0 && isSuccess(resp.StatusCode) && resp.StatusCode != http.StatusNoContent:
-			lastErr = fmt.Errorf("%s: empty response body", resp.Status)
-		default:
-			return &Response{Status: resp.Status, StatusCode: resp.StatusCode, Header: resp.Header, Body: body.Bytes()}, nil
+		case o.resp != nil:
+			return o.resp, nil
+		case o.permanent:
+			return nil, o.err
+		case ctx.Err() != nil:
+			return nil, withContext(ctx, o.err)
+		case o.unrecoverable:
+			return nil, o.err
+		}
+
+		// A paced retry waits as the server says, so it is not counted
+		// as an attempt and does not spend the budget.
+		if o.limited != nil && paced < maxPaced {
+			d, source, ok := paceDelay(p.Pacer, o)
+			if ok {
+				paced++
+				log.Info("rate limited, waiting", "wait", d, "source", source)
+				if err := wait(ctx, d); err != nil {
+					return nil, withContext(ctx, o.err)
+				}
+				continue
+			}
+		}
+
+		failed++
+		if failed == attempts {
+			return nil, &Error{Attempts: attempts, StatusCode: o.status, Err: o.err}
+		}
+		if !p.Budget.take(time.Now()) {
+			return nil, &Error{Attempts: failed, StatusCode: o.status, Err: fmt.Errorf("%w: %w", ErrBudgetExhausted, o.err)}
+		}
+		d := max(backoff(failed, p), min(o.retryAfter, p.MaxDelay))
+		log.Warn("retrying request", "retry", failed, "max", attempts, "backoff", d, "status", o.status, "error", o.err)
+		if err := wait(ctx, d); err != nil {
+			return nil, withContext(ctx, o.err)
 		}
 	}
-	if ctx.Err() != nil {
-		return nil, withContext(ctx, lastErr)
+}
+
+// outcome is the result of one call to send.
+type outcome struct {
+	// resp is the response if it is not retried.
+	resp *Response
+	// err is why the attempt failed.
+	err error
+	// permanent is whether send marked err as Permanent, in which case
+	// Do returns err without further attempts.
+	permanent bool
+	// unrecoverable is whether err is a transport error that cannot be
+	// fixed by trying again. Do returns it unless ctx is done.
+	unrecoverable bool
+	// status is the status code of a retried response, or zero if
+	// there was none.
+	status int
+	// retryAfter is the wait asked for by a retried response's
+	// Retry-After header.
+	retryAfter time.Duration
+	// limited is the response if it was a 429.
+	limited *http.Response
+}
+
+// classify reads the result of a call to send and decides whether it is
+// a response to return, a failure to retry, or a failure that must not be
+// retried. It reads and closes the body of resp.
+func classify(resp *http.Response, err error) outcome {
+	if err != nil {
+		var perm permanentError
+		if errors.As(err, &perm) {
+			return outcome{err: perm.err, permanent: true}
+		}
+		return outcome{err: err, unrecoverable: isUnrecoverable(err)}
 	}
-	return nil, &Error{Attempts: attempts, StatusCode: lastStatus, Err: lastErr}
+
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		o := outcome{
+			err:        statusError(resp.Status, readExcerpt(resp)),
+			status:     resp.StatusCode,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			o.limited = resp
+		}
+		return o
+	}
+
+	var body bytes.Buffer
+	_, err = io.Copy(&body, resp.Body)
+	resp.Body.Close()
+	switch {
+	case err != nil:
+		return outcome{err: fmt.Errorf("%s: read body: %w", resp.Status, err), status: resp.StatusCode}
+	case body.Len() == 0 && isSuccess(resp.StatusCode) && resp.StatusCode != http.StatusNoContent:
+		return outcome{err: fmt.Errorf("%s: empty response body", resp.Status), status: resp.StatusCode}
+	}
+	return outcome{resp: &Response{Status: resp.Status, StatusCode: resp.StatusCode, Header: resp.Header, Body: body.Bytes()}}
 }
 
 // withContext returns err wrapped with ctx.Err(), unless it already wraps it.
@@ -303,35 +318,40 @@ const (
 	drainLimit = 64 << 10
 )
 
-// pace waits after a 429 response, for as long as its Retry-After header
-// asks, up to maxPaceWait, or as pacer decides if the header is missing or
-// gives no wait. It reports false if neither gives a wait.
-func pace(ctx context.Context, pacer Pacer, resp *http.Response, log *slog.Logger) (bool, error) {
-	d := retryAfterWait(resp.Header, time.Now())
-	if d > 0 {
-		log.Info("rate limited, waiting as Retry-After asks", "wait", d)
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-time.After(d):
-			return true, nil
-		}
+// paceDelay returns the wait after o, a 429 response: as long as its
+// Retry-After header asks, or as pacer decides if the header is missing
+// or gives no wait, up to maxPaceWait. It also returns which of the two
+// set the wait, for logging. It reports false if neither gives a wait.
+func paceDelay(pacer Pacer, o outcome) (d time.Duration, source string, ok bool) {
+	if o.retryAfter > 0 {
+		return min(o.retryAfter, maxPaceWait), "Retry-After", true
 	}
 	if pacer == nil {
-		return false, nil
+		return 0, "", false
 	}
-	return pacer.Wait(ctx, resp)
+	d, ok = pacer.Delay(o.limited)
+	if !ok || d <= 0 {
+		return 0, "", false
+	}
+	return min(d, maxPaceWait), "pacer", true
 }
 
-// retryAfterWait returns the wait asked for by h's Retry-After header, up
-// to maxPaceWait.
-func retryAfterWait(h http.Header, now time.Time) time.Duration {
-	return min(parseRetryAfter(h.Get("Retry-After"), now), maxPaceWait)
-}
-
-// maxPaceWait caps a wait asked for by a 429's Retry-After header. It is
-// also the cap on other waits when Policy.MaxDelay is not set.
+// maxPaceWait caps the wait after a 429 response. It is also the cap on
+// other waits when Policy.MaxDelay is not set.
 const maxPaceWait = 30 * time.Minute
+
+// wait waits for d, or until ctx is done, in which case it returns
+// ctx.Err().
+func wait(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
 
 // statusError returns an error for a retried response with the given
 // status and the start of its body.

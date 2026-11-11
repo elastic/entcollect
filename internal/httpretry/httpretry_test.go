@@ -7,6 +7,7 @@ package httpretry
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -454,6 +456,13 @@ func TestDoContextErrors(t *testing.T) {
 			want: errBad,
 		},
 		{
+			name: "unrecoverable",
+			send: func(ctx context.Context, cancel func()) (*http.Response, error) {
+				cancel()
+				return nil, &url.Error{Op: "Get", URL: "https://example.com", Err: x509.UnknownAuthorityError{}}
+			},
+		},
+		{
 			name: "body_read",
 			send: func(ctx context.Context, cancel func()) (*http.Response, error) {
 				resp := fakeResponse(http.StatusOK, "")
@@ -642,22 +651,19 @@ func TestDoBareRateLimitSpendsBudget(t *testing.T) {
 }
 
 func TestDoPacer(t *testing.T) {
-	errPacer := errors.New("pacer failed")
 	tests := []struct {
 		name       string
 		retryAfter string
 		pacer      *fakePacer
 		wantErr    bool
-		wantErrIs  error
 		// wantErrText, if set, must appear in the error.
 		wantErrText string
 		wantPacer   int
 	}{
-		{name: "paced", pacer: &fakePacer{ok: true}, wantPacer: 1},
+		{name: "paced", pacer: &fakePacer{ok: true, d: time.Millisecond}, wantPacer: 1},
 		{name: "no_pace", pacer: &fakePacer{ok: false}, wantErr: true, wantErrText: "429 Too Many Requests: slow down", wantPacer: 1},
-		{name: "pacer_error", pacer: &fakePacer{err: errPacer}, wantErr: true, wantErrIs: errPacer, wantPacer: 1},
 		{name: "retry_after_wins", retryAfter: "1", pacer: &fakePacer{ok: false}, wantPacer: 0},
-		{name: "zero_retry_after", retryAfter: "0", pacer: &fakePacer{ok: true}, wantPacer: 1},
+		{name: "zero_retry_after", retryAfter: "0", pacer: &fakePacer{ok: true, d: time.Millisecond}, wantPacer: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -678,9 +684,6 @@ func TestDoPacer(t *testing.T) {
 			if gotErr := err != nil; gotErr != tc.wantErr {
 				t.Errorf("Do error = %v; want error %t", err, tc.wantErr)
 			}
-			if tc.wantErrIs != nil && !errors.Is(err, tc.wantErrIs) {
-				t.Errorf("Do error = %v; want it to wrap %v", err, tc.wantErrIs)
-			}
 			if tc.wantErrText != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErrText)) {
 				t.Errorf("Do error = %v; want it to contain %q", err, tc.wantErrText)
 			}
@@ -694,7 +697,7 @@ func TestDoPacer(t *testing.T) {
 // TestDoPacedAfterFailure checks that a paced retry following a counted
 // failure does not spend the budget.
 func TestDoPacedAfterFailure(t *testing.T) {
-	p := Policy{Attempts: 2, BaseDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond, Budget: NewBudget(1, time.Hour), Pacer: &fakePacer{ok: true}}
+	p := Policy{Attempts: 2, BaseDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond, Budget: NewBudget(1, time.Hour), Pacer: &fakePacer{ok: true, d: time.Millisecond}}
 	var calls atomic.Int32
 	_, err := Do(t.Context(), p, slog.New(slog.DiscardHandler), func(context.Context) (*http.Response, error) {
 		switch calls.Add(1) {
@@ -722,7 +725,7 @@ func TestDoMaxPaced(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pacer := &fakePacer{ok: true}
+			pacer := &fakePacer{ok: true, d: time.Millisecond}
 			p := Policy{Attempts: 1, MaxPaced: tc.maxPaced, Pacer: pacer}
 			var calls atomic.Int32
 			_, err := Do(t.Context(), p, slog.New(slog.DiscardHandler), func(context.Context) (*http.Response, error) {
@@ -745,7 +748,7 @@ func TestDoMaxPaced(t *testing.T) {
 func TestDoPacingCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	p := Policy{Attempts: 1, Pacer: blockingPacer{cancel: cancel}}
+	p := Policy{Attempts: 1, Pacer: cancelPacer{cancel: cancel}}
 	_, err := Do(ctx, p, slog.New(slog.DiscardHandler), func(context.Context) (*http.Response, error) {
 		return fakeResponse(http.StatusTooManyRequests, "slow down"), nil
 	})
@@ -757,45 +760,50 @@ func TestDoPacingCancelled(t *testing.T) {
 	}
 }
 
-func TestRetryAfterWait(t *testing.T) {
-	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+func TestPaceDelay(t *testing.T) {
 	for _, tc := range []struct {
-		value string
-		want  time.Duration
+		name       string
+		retryAfter time.Duration
+		pacer      Pacer
+		want       time.Duration
+		wantOK     bool
 	}{
-		{value: "", want: 0},
-		{value: "120", want: 2 * time.Minute},
-		{value: "86400", want: maxPaceWait},
+		{name: "none"},
+		{name: "retry_after", retryAfter: 2 * time.Minute, want: 2 * time.Minute, wantOK: true},
+		{name: "retry_after_capped", retryAfter: 24 * time.Hour, want: maxPaceWait, wantOK: true},
+		{name: "retry_after_wins", retryAfter: time.Minute, pacer: &fakePacer{ok: true, d: time.Hour}, want: time.Minute, wantOK: true},
+		{name: "pacer", pacer: &fakePacer{ok: true, d: time.Minute}, want: time.Minute, wantOK: true},
+		{name: "pacer_capped", pacer: &fakePacer{ok: true, d: 24 * time.Hour}, want: maxPaceWait, wantOK: true},
+		{name: "pacer_declines", pacer: &fakePacer{ok: false}},
+		{name: "pacer_no_wait", pacer: &fakePacer{ok: true}},
+		{name: "pacer_negative", pacer: &fakePacer{ok: true, d: -time.Minute}},
 	} {
-		h := http.Header{}
-		if tc.value != "" {
-			h.Set("Retry-After", tc.value)
-		}
-		if got := retryAfterWait(h, now); got != tc.want {
-			t.Errorf("retryAfterWait(%q) = %v; want %v", tc.value, got, tc.want)
+		o := outcome{retryAfter: tc.retryAfter, limited: fakeResponse(http.StatusTooManyRequests, "")}
+		got, _, ok := paceDelay(tc.pacer, o)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("%s: paceDelay = %v, %t; want %v, %t", tc.name, got, ok, tc.want, tc.wantOK)
 		}
 	}
 }
 
-// blockingPacer cancels the context, then waits for it to be done.
-type blockingPacer struct{ cancel func() }
+// cancelPacer cancels the context and asks for a long wait.
+type cancelPacer struct{ cancel func() }
 
-func (p blockingPacer) Wait(ctx context.Context, _ *http.Response) (bool, error) {
+func (p cancelPacer) Delay(*http.Response) (time.Duration, bool) {
 	p.cancel()
-	<-ctx.Done()
-	return false, ctx.Err()
+	return time.Hour, true
 }
 
-// fakePacer is a Pacer that returns fixed results without waiting.
+// fakePacer is a Pacer that returns fixed results.
 type fakePacer struct {
+	d     time.Duration
 	ok    bool
-	err   error
 	calls int
 }
 
-func (p *fakePacer) Wait(context.Context, *http.Response) (bool, error) {
+func (p *fakePacer) Delay(*http.Response) (time.Duration, bool) {
 	p.calls++
-	return p.ok, p.err
+	return p.d, p.ok
 }
 
 // TestDoBudgetContextDone checks that a done context is reported even
