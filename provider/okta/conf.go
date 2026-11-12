@@ -6,10 +6,10 @@ package okta
 
 import (
 	"errors"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/elastic/entcollect/internal/urlhost"
 )
 
 // DefaultIDSetShards is the default number of shards used by each ID set.
@@ -108,7 +108,7 @@ func (c *Config) Validate() error {
 	switch {
 	case c.Domain == "":
 		return errMissingDomain
-	case !validHost(domainHost(c.Domain)):
+	case !urlhost.Valid(domainHost(c.Domain)):
 		return errInvalidDomain
 	case c.Token == "" && c.OAuth2 == nil:
 		return errNoAuth
@@ -156,33 +156,6 @@ func domainHost(domain string) string {
 		return domain[len(scheme):]
 	}
 	return domain
-}
-
-// validHost reports whether s parses as exactly the host, with an optional
-// port, of an https URL, so that it can be used as the host of the
-// domain's API URLs. Anything else in s, such as a scheme, user
-// information or a path, makes the parsed host differ from s. An IPv6
-// address must be in brackets, and a port must be a number from 1 to
-// 65535. It does not check the syntax of the host name itself.
-func validHost(s string) bool {
-	u, err := url.Parse("https://" + s)
-	if err != nil || u.Host != s || u.Hostname() == "" {
-		return false
-	}
-	// Depending on the main module's Go version, url.Parse may accept an
-	// unbracketed IPv6 address, taking its last group as the port.
-	if !strings.HasPrefix(s, "[") && strings.Contains(u.Hostname(), ":") {
-		return false
-	}
-	if strings.HasSuffix(s, ":") {
-		return false
-	}
-	port := u.Port()
-	if port == "" {
-		return true
-	}
-	n, err := strconv.Atoi(port)
-	return err == nil && 1 <= n && n <= 65535
 }
 
 func (c *Config) wantUsers() bool {
