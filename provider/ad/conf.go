@@ -33,7 +33,9 @@ type Config struct {
 	IncludeEmptyGroups bool     `json:"include_empty_groups"`
 	UserAttrs          []string `json:"user_attributes"`
 	GrpAttrs           []string `json:"group_attributes"`
-	PagingSize         uint32   `json:"ad_paging_size"`
+	// PagingSize is the LDAP search page size. Zero uses 500
+	// (defaultPagingSize).
+	PagingSize uint32 `json:"ad_paging_size"`
 
 	IDSetShards    int           `json:"idset_shards"`
 	SyncInterval   time.Duration `json:"sync_interval"`

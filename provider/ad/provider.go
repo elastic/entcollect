@@ -182,7 +182,7 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 // timestamp seen.
 func (p *Provider) syncEntities(ctx context.Context, pub entcollect.Publisher, log *slog.Logger, ids *idset.Set, entTyp string, now, since time.Time) (time.Time, error) {
 	query, kind, idField := p.entityParams(entTyp)
-	entries, err := GetDetails(query, p.cfg.URL, p.cfg.User, p.cfg.Password, p.baseDN, since, p.cfg.UserAttrs, p.cfg.GrpAttrs, p.cfg.PagingSize, nil, p.cfg.TLS, entTyp)
+	entries, err := GetDetails(ctx, query, p.cfg.URL, p.cfg.User, p.cfg.Password, p.baseDN, since, p.cfg.UserAttrs, p.cfg.GrpAttrs, p.cfg.PagingSize, nil, p.cfg.TLS, entTyp)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("ad: get %s details: %w", entTyp, err)
 	}
@@ -239,7 +239,7 @@ func (p *Provider) entityParams(entTyp string) (query string, kind entcollect.En
 // document for each. If ids is non-nil, group IDs are added. Returns the
 // latest whenChanged timestamp seen.
 func (p *Provider) syncEmptyGroups(ctx context.Context, pub entcollect.Publisher, log *slog.Logger, ids *idset.Set, now, since time.Time) (time.Time, error) {
-	entries, err := GetEmptyGroups(p.cfg.URL, p.cfg.User, p.cfg.Password, p.baseDN, since, p.cfg.GrpAttrs, p.cfg.PagingSize, nil, p.cfg.TLS)
+	entries, err := GetEmptyGroups(ctx, p.cfg.URL, p.cfg.User, p.cfg.Password, p.baseDN, since, p.cfg.GrpAttrs, p.cfg.PagingSize, nil, p.cfg.TLS)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("ad: get empty groups: %w", err)
 	}
