@@ -5,7 +5,6 @@
 package okta
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,18 +13,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/elastic/entcollect/internal/httpretry"
 )
 
 // ISO8601 is the time format accepted by Okta queries.
 const ISO8601 = "2006-01-02T15:04:05.000Z"
-
-const (
-	maxRetryAttempts = 5
-	retryBaseDelay   = time.Second
-	retryMaxDelay    = 30 * time.Second
-)
 
 // User is an Okta user's details.
 //
@@ -130,7 +126,7 @@ type Device struct {
 	Status              string            `json:"status"`
 	Links               HAL               `json:"_links,omitempty"`
 
-	// Users is populated by GetDeviceUsers, not the list devices response.
+	// Users is populated by getDeviceUsers, not the list devices response.
 	Users []User `json:"users,omitempty"`
 }
 
@@ -227,104 +223,104 @@ type entity interface {
 	User | Group | Role | Factor | Device | devUser | permissionsWrapper
 }
 
-// GetUsers returns users from the Okta list users API. If query is nil, all
+// getUsers returns users from the Okta list users API. If query is nil, all
 // active users are returned (excluding DEPROVISIONED). To include all statuses,
 // pass search=status pr.
-func GetUsers(ctx context.Context, cli *http.Client, host, key string, query url.Values, omit Response, lim *RateLimiter, log *slog.Logger) ([]User, http.Header, error) {
+func getUsers(ctx context.Context, cli *http.Client, host, key string, query url.Values, omit Response, lim *RateLimiter, log *slog.Logger) ([]User, http.Header, error) {
 	u := &url.URL{
 		Scheme:   "https",
 		Host:     host,
 		Path:     "/api/v1/users",
 		RawQuery: query.Encode(),
 	}
-	return get[User](ctx, cli, u, "/api/v1/users", key, omit, lim, log)
+	return get[User](ctx, cli, u, "/api/v1/users", key, omit, lim, nil, log)
 }
 
-// GetGroups returns all groups from the Okta list groups API (paginated).
-func GetGroups(ctx context.Context, cli *http.Client, host, key string, query url.Values, lim *RateLimiter, log *slog.Logger) ([]Group, http.Header, error) {
+// getGroups returns all groups from the Okta list groups API (paginated).
+func getGroups(ctx context.Context, cli *http.Client, host, key string, query url.Values, lim *RateLimiter, log *slog.Logger) ([]Group, http.Header, error) {
 	u := &url.URL{
 		Scheme:   "https",
 		Host:     host,
 		Path:     "/api/v1/groups",
 		RawQuery: query.Encode(),
 	}
-	return get[Group](ctx, cli, u, "/api/v1/groups", key, OmitNone, lim, log)
+	return get[Group](ctx, cli, u, "/api/v1/groups", key, OmitNone, lim, nil, log)
 }
 
-// GetGroupMembers returns the users that are members of the specified group.
-func GetGroupMembers(ctx context.Context, cli *http.Client, host, key, groupID string, query url.Values, lim *RateLimiter, log *slog.Logger) ([]User, http.Header, error) {
+// getGroupMembers returns the users that are members of the specified group.
+func getGroupMembers(ctx context.Context, cli *http.Client, host, key, groupID string, query url.Values, lim *RateLimiter, log *slog.Logger) ([]User, http.Header, error) {
 	if groupID == "" {
 		return nil, nil, errors.New("no group specified")
 	}
 	const endpoint = "/api/v1/groups/{groupId}/users"
 	path := strings.Replace(endpoint, "{groupId}", groupID, 1)
 	u := &url.URL{Scheme: "https", Host: host, Path: path, RawQuery: query.Encode()}
-	return get[User](ctx, cli, u, endpoint, key, OmitNone, lim, log)
+	return get[User](ctx, cli, u, endpoint, key, OmitNone, lim, nil, log)
 }
 
-// GetUserGroups returns the groups a specific user belongs to.
-func GetUserGroups(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, log *slog.Logger) ([]Group, http.Header, error) {
+// getUserGroups returns the groups a specific user belongs to.
+func getUserGroups(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) ([]Group, http.Header, error) {
 	if userID == "" {
 		return nil, nil, errors.New("no user specified")
 	}
 	const endpoint = "/api/v1/users/{user}/groups"
 	path := strings.Replace(endpoint, "{user}", userID, 1)
 	u := &url.URL{Scheme: "https", Host: host, Path: path}
-	return get[Group](ctx, cli, u, endpoint, key, OmitNone, lim, log)
+	return get[Group](ctx, cli, u, endpoint, key, OmitNone, lim, budget, log)
 }
 
-// GetUserFactors returns the enrolled factors for a user.
-func GetUserFactors(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, log *slog.Logger) ([]Factor, http.Header, error) {
+// getUserFactors returns the enrolled factors for a user.
+func getUserFactors(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) ([]Factor, http.Header, error) {
 	if userID == "" {
 		return nil, nil, errors.New("no user specified")
 	}
 	const endpoint = "/api/v1/users/{user}/factors"
 	path := strings.Replace(endpoint, "{user}", userID, 1)
 	u := &url.URL{Scheme: "https", Host: host, Path: path}
-	return get[Factor](ctx, cli, u, endpoint, key, OmitNone, lim, log)
+	return get[Factor](ctx, cli, u, endpoint, key, OmitNone, lim, budget, log)
 }
 
-// GetUserRoles returns the assigned roles for a user.
-func GetUserRoles(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, log *slog.Logger) ([]Role, http.Header, error) {
+// getUserRoles returns the assigned roles for a user.
+func getUserRoles(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) ([]Role, http.Header, error) {
 	if userID == "" {
 		return nil, nil, errors.New("no user specified")
 	}
 	const endpoint = "/api/v1/users/{user}/roles"
 	path := strings.Replace(endpoint, "{user}", userID, 1)
 	u := &url.URL{Scheme: "https", Host: host, Path: path}
-	return get[Role](ctx, cli, u, endpoint, key, OmitNone, lim, log)
+	return get[Role](ctx, cli, u, endpoint, key, OmitNone, lim, budget, log)
 }
 
-// GetRolePermissions returns the permissions for a custom role.
+// getRolePermissions returns the permissions for a custom role.
 // The Okta API returns a single object {"permissions":[...]} here,
 // not a JSON array, so we use getSingle rather than get.
-func GetRolePermissions(ctx context.Context, cli *http.Client, host, key, roleID string, lim *RateLimiter, log *slog.Logger) ([]Permission, http.Header, error) {
+func getRolePermissions(ctx context.Context, cli *http.Client, host, key, roleID string, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) ([]Permission, http.Header, error) {
 	if roleID == "" {
 		return nil, nil, errors.New("no role ID specified")
 	}
 	const endpoint = "/api/v1/iam/roles/{roleId}/permissions"
 	path := strings.Replace(endpoint, "{roleId}", roleID, 1)
 	u := &url.URL{Scheme: "https", Host: host, Path: path}
-	result, h, err := getSingle[permissionsWrapper](ctx, cli, u, endpoint, key, lim, log)
+	result, h, err := getSingle[permissionsWrapper](ctx, cli, u, endpoint, key, lim, budget, log)
 	if err != nil {
 		return nil, h, err
 	}
 	return result.Permissions, h, nil
 }
 
-// GetDevices returns devices from the Okta list devices API.
-func GetDevices(ctx context.Context, cli *http.Client, host, key string, query url.Values, lim *RateLimiter, log *slog.Logger) ([]Device, http.Header, error) {
+// getDevices returns devices from the Okta list devices API.
+func getDevices(ctx context.Context, cli *http.Client, host, key string, query url.Values, lim *RateLimiter, log *slog.Logger) ([]Device, http.Header, error) {
 	u := &url.URL{
 		Scheme:   "https",
 		Host:     host,
 		Path:     "/api/v1/devices",
 		RawQuery: query.Encode(),
 	}
-	return get[Device](ctx, cli, u, "/api/v1/devices", key, OmitNone, lim, log)
+	return get[Device](ctx, cli, u, "/api/v1/devices", key, OmitNone, lim, nil, log)
 }
 
-// GetDeviceUsers returns the users associated with a device.
-func GetDeviceUsers(ctx context.Context, cli *http.Client, host, key, deviceID string, query url.Values, omit Response, lim *RateLimiter, log *slog.Logger) ([]User, http.Header, error) {
+// getDeviceUsers returns the users associated with a device.
+func getDeviceUsers(ctx context.Context, cli *http.Client, host, key, deviceID string, query url.Values, omit Response, lim *RateLimiter, log *slog.Logger) ([]User, http.Header, error) {
 	if deviceID == "" {
 		return nil, nil, nil
 	}
@@ -336,7 +332,7 @@ func GetDeviceUsers(ctx context.Context, cli *http.Client, host, key, deviceID s
 		Path:     path,
 		RawQuery: query.Encode(),
 	}
-	raw, h, err := get[devUser](ctx, cli, u, endpoint, key, omit, lim, log)
+	raw, h, err := get[devUser](ctx, cli, u, endpoint, key, omit, lim, nil, log)
 	if err != nil {
 		return nil, h, err
 	}
@@ -347,21 +343,21 @@ func GetDeviceUsers(ctx context.Context, cli *http.Client, host, key, deviceID s
 	return users, h, nil
 }
 
-// GetUserDevices returns the devices enrolled by a user.
-func GetUserDevices(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, log *slog.Logger) ([]Device, http.Header, error) {
+// getUserDevices returns the devices enrolled by a user.
+func getUserDevices(ctx context.Context, cli *http.Client, host, key, userID string, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) ([]Device, http.Header, error) {
 	if userID == "" {
 		return nil, nil, errors.New("no user specified")
 	}
 	const endpoint = "/api/v1/users/{user}/devices"
 	path := strings.Replace(endpoint, "{user}", userID, 1)
 	u := &url.URL{Scheme: "https", Host: host, Path: path}
-	return get[Device](ctx, cli, u, endpoint, key, OmitNone, lim, log)
+	return get[Device](ctx, cli, u, endpoint, key, OmitNone, lim, budget, log)
 }
 
 // get is the generic HTTP request function for the Okta API.
 // It unmarshals the JSON response body as an array of E.
-func get[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, omit Response, lim *RateLimiter, log *slog.Logger) ([]E, http.Header, error) {
-	body, h, err := doRequest(ctx, cli, u, endpoint, key, omit, lim, log)
+func get[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, omit Response, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) ([]E, http.Header, error) {
+	body, h, err := doRequest(ctx, cli, u, endpoint, key, omit, lim, budget, log)
 	if err != nil {
 		return nil, h, err
 	}
@@ -375,9 +371,9 @@ func get[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, 
 // getSingle is like get but unmarshals the response as a single JSON
 // object rather than an array. Use for endpoints that return an object
 // wrapping a nested array (e.g. /api/v1/iam/roles/{roleId}/permissions).
-func getSingle[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, lim *RateLimiter, log *slog.Logger) (E, http.Header, error) {
+func getSingle[E entity](ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) (E, http.Header, error) {
 	var zero E
-	body, h, err := doRequest(ctx, cli, u, endpoint, key, OmitNone, lim, log)
+	body, h, err := doRequest(ctx, cli, u, endpoint, key, OmitNone, lim, budget, log)
 	if err != nil {
 		return zero, h, err
 	}
@@ -388,24 +384,26 @@ func getSingle[E entity](ctx context.Context, cli *http.Client, u *url.URL, endp
 	return e, h, nil
 }
 
-// doRequest executes an HTTP GET with retries, rate limiting, and
-// exponential backoff. It returns the raw response body on success.
-func doRequest(ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, omit Response, lim *RateLimiter, log *slog.Logger) ([]byte, http.Header, error) {
-	target := u.String()
-	for attempt := range maxRetryAttempts {
-		if attempt > 0 {
-			d := retryDelay(attempt)
-			log.Warn("retrying request", "retry", attempt, "max", maxRetryAttempts, "backoff", d, "url", target)
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(d):
-			}
-		}
+// retryPolicy is the retry policy for Okta API requests.
+var retryPolicy = httpretry.Policy{
+	Attempts:  5,
+	BaseDelay: time.Second,
+	MaxDelay:  30 * time.Second,
+}
 
+// doRequest executes an HTTP GET with rate limiting, retrying transient
+// failures with exponential backoff (see httpretry). Retries are limited by
+// budget if it is not nil. It returns the raw response body on success.
+func doRequest(ctx context.Context, cli *http.Client, u *url.URL, endpoint, key string, omit Response, lim *RateLimiter, budget *httpretry.Budget, log *slog.Logger) ([]byte, http.Header, error) {
+	target := u.String()
+	log = log.With("url", target)
+	policy := retryPolicy
+	policy.Budget = budget
+	policy.Pacer = resetPacer{}
+	resp, err := httpretry.Do(ctx, policy, log, func(ctx context.Context) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
-			return nil, nil, err
+			return nil, httpretry.Permanent(err)
 		}
 		req.Header.Set("Accept", "application/json")
 		contentType := "application/json"
@@ -413,52 +411,86 @@ func doRequest(ctx context.Context, cli *http.Client, u *url.URL, endpoint, key 
 			contentType += "; " + omit.String()
 		}
 		req.Header.Set("Content-Type", contentType)
-
 		if key != "" {
 			req.Header.Set("Authorization", "SSWS "+key)
 		}
 
 		if err := lim.Wait(ctx, endpoint); err != nil {
-			return nil, nil, err
+			return nil, httpretry.Permanent(err)
 		}
 		resp, err := cli.Do(req)
 		if err != nil {
-			if isContextErr(err) {
-				return nil, nil, err
-			}
-			log.Warn("request failed", "error", err, "url", target)
-			continue
+			return nil, err
 		}
-
-		err = lim.Update(endpoint, resp.Header, log)
-		if err != nil {
+		if err := lim.Update(endpoint, resp.Header, log); err != nil {
 			resp.Body.Close()
-			return nil, nil, err
+			return nil, httpretry.Permanent(err)
 		}
-
-		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			continue
-		}
-
-		var body bytes.Buffer
-		_, err = io.Copy(&body, resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, nil, err
-		}
-		if body.Len() == 0 {
-			return nil, nil, errors.New("empty response body")
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, resp.Header, recoverError(body.Bytes())
-		}
-
-		return body.Bytes(), resp.Header, nil
+		return resp, nil
+	})
+	if err != nil {
+		return nil, nil, err
 	}
-	return nil, nil, fmt.Errorf("all %d attempts failed", maxRetryAttempts)
+	if resp.StatusCode != http.StatusOK {
+		err := responseError(resp.Status, resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			err = notFoundError{err}
+		}
+		return nil, resp.Header, err
+	}
+	return resp.Body, resp.Header, nil
 }
+
+// resetPacer makes Do wait after a 429 response until the rate limit
+// resets, at the time given by Okta's X-Rate-Limit-Reset header. It keeps
+// no state between requests: once the limit has reset, later requests
+// need not wait for it again.
+type resetPacer struct{}
+
+func (resetPacer) Delay(resp *http.Response) (time.Duration, bool) {
+	d := resetWait(resp.Header, time.Now())
+	return d, d > 0
+}
+
+// resetWait returns how long to wait, from now, for the rate limit reset
+// given by h's X-Rate-Limit-Reset header, up to maxWait. The reset time
+// is in the server's clock, so it is measured from h's Date header when
+// there is one. It returns zero if there is no valid reset time ahead.
+func resetWait(h http.Header, now time.Time) time.Duration {
+	secs, err := strconv.ParseInt(h.Get("X-Rate-Limit-Reset"), 10, 64)
+	if err != nil {
+		return 0
+	}
+	reset := time.Unix(secs, 0)
+	if date, err := http.ParseTime(h.Get("Date")); err == nil {
+		return min(max(reset.Sub(date), 0), maxWait)
+	}
+	return min(max(reset.Sub(now), 0), maxWait)
+}
+
+// responseError returns the error for a response with the given status,
+// other than 200. It uses Okta's error details when body holds them, and
+// otherwise the start of body.
+func responseError(status string, body []byte) error {
+	if len(body) == 0 {
+		return fmt.Errorf("%s: empty response body", status)
+	}
+	var e Error
+	if err := json.Unmarshal(body, &e); err == nil && e.Summary != "" {
+		return fmt.Errorf("%s: %w", status, &e)
+	}
+	const limit = 256
+	if len(body) > limit {
+		body = append(body[:limit:limit], "..."...)
+	}
+	return fmt.Errorf("%s: %s", status, body)
+}
+
+// notFoundError marks the error for a 404 response. Its text is that of
+// the error it wraps.
+type notFoundError struct{ error }
+
+func (e notFoundError) Unwrap() error { return e.error }
 
 func recoverError(msg []byte) error {
 	var e Error
@@ -495,16 +527,4 @@ func Next(h http.Header) (url.Values, error) {
 		}
 	}
 	return nil, io.EOF
-}
-
-func retryDelay(attempt int) time.Duration {
-	d := time.Duration(1<<uint(attempt-1)) * retryBaseDelay
-	if d > retryMaxDelay {
-		d = retryMaxDelay
-	}
-	return d
-}
-
-func isContextErr(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

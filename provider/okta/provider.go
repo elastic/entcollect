@@ -33,6 +33,7 @@ import (
 
 	"github.com/elastic/entcollect"
 	"github.com/elastic/entcollect/idset"
+	"github.com/elastic/entcollect/internal/httpretry"
 )
 
 const (
@@ -46,6 +47,11 @@ const (
 type Provider struct {
 	cfg    Config
 	client *http.Client
+
+	// enrichBudget limits retries of per-user enrichment requests. A
+	// failed enrichment is skipped, so when an enrichment endpoint keeps
+	// failing, retrying every user would only slow the sync down.
+	enrichBudget *httpretry.Budget
 }
 
 var _ entcollect.Provider = (*Provider)(nil)
@@ -62,12 +68,24 @@ func NewWithClient(cfg Config, client *http.Client) *Provider {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &Provider{cfg: cfg, client: client}
+	return &Provider{
+		cfg:          cfg,
+		client:       client,
+		enrichBudget: httpretry.NewBudget(enrichRetryLimit, enrichRetryWindow),
+	}
 }
+
+// Per-user enrichment requests may be retried at most enrichRetryLimit
+// times within any enrichRetryWindow, across all users.
+const (
+	enrichRetryLimit  = 20
+	enrichRetryWindow = 5 * time.Minute
+)
 
 // FullSync enumerates all entities from Okta, emits a document for each,
 // and detects deletions via idsets.
 func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub entcollect.Publisher, log *slog.Logger) error {
+	var skipped skippedEnrichment
 	cli, key, err := p.authClient(ctx)
 	if err != nil {
 		return fmt.Errorf("okta: auth: %w", err)
@@ -126,7 +144,7 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 					fields["supervises"] = subs
 				}
 			}
-			if err := p.enrichUser(ctx, cli, key, lim, log, enrich, permCache, &u, fields); err != nil {
+			if err := p.enrichUser(ctx, cli, key, lim, log, enrich, permCache, &skipped, &u, fields); err != nil {
 				return err
 			}
 
@@ -177,17 +195,23 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		var latestDevice time.Time
 		for i := range allDevices {
 			d := &allDevices[i]
-			devices.Add(d.ID)
-
 			if d.LastUpdated.After(latestDevice) {
 				latestDevice = d.LastUpdated
 			}
 
-			devUsers, _, err := GetDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
+			devUsers, _, err := getDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
+			if errors.As(err, new(notFoundError)) {
+				// The device was deleted after it was listed. Leaving it
+				// out of the set reports its deletion below if an earlier
+				// sync saw it.
+				log.Info("device deleted during sync, skipping", "device", d.ID)
+				continue
+			}
 			if err != nil {
 				return fmt.Errorf("okta: get device users for %s: %w", d.ID, err)
 			}
 			d.Users = devUsers
+			devices.Add(d.ID)
 
 			action := entcollect.ActionDiscovered
 			if devices.WasPresent(d.ID) {
@@ -227,7 +251,7 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 		}
 	}
 
-	return nil
+	return skipped.err()
 }
 
 // IncrementalSync fetches only entities changed since the last sync. Idsets
@@ -235,6 +259,7 @@ func (p *Provider) FullSync(ctx context.Context, store entcollect.Store, pub ent
 // "deleted", so running the idset would cause false deletions on the next
 // full sync.
 func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, pub entcollect.Publisher, log *slog.Logger) error {
+	var skipped skippedEnrichment
 	cli, key, err := p.authClient(ctx)
 	if err != nil {
 		return fmt.Errorf("okta: auth: %w", err)
@@ -274,7 +299,7 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 			}
 
 			if enrich["groups"] {
-				groups, _, err := GetUserGroups(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
+				groups, _, err := getUserGroups(ctx, cli, p.cfg.Domain, key, u.ID, lim, p.enrichBudget, log)
 				switch {
 				case err == nil:
 					fields["groups"] = groups
@@ -282,6 +307,7 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 					return fmt.Errorf("okta: get groups for user %s: %w", u.ID, err)
 				default:
 					log.Warn("groups enrichment failed, continuing without groups data", "user", u.ID, "error", err)
+					skipped.add("groups for user "+u.ID, err)
 				}
 			}
 			if supervisesMapping != nil {
@@ -289,7 +315,7 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 					fields["supervises"] = subs
 				}
 			}
-			if err := p.enrichUser(ctx, cli, key, lim, log, enrich, permCache, &u, fields); err != nil {
+			if err := p.enrichUser(ctx, cli, key, lim, log, enrich, permCache, &skipped, &u, fields); err != nil {
 				return err
 			}
 
@@ -333,7 +359,13 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 			if d.LastUpdated.After(latestDevice) {
 				latestDevice = d.LastUpdated
 			}
-			devUsers, _, err := GetDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
+			devUsers, _, err := getDeviceUsers(ctx, cli, p.cfg.Domain, key, d.ID, nil, OmitNone, lim, log)
+			if errors.As(err, new(notFoundError)) {
+				// The device was deleted after it was listed. The next
+				// full sync reports its deletion.
+				log.Info("device deleted during sync, skipping", "device", d.ID)
+				continue
+			}
 			if err != nil {
 				return fmt.Errorf("okta: get device users for %s: %w", d.ID, err)
 			}
@@ -357,7 +389,7 @@ func (p *Provider) IncrementalSync(ctx context.Context, store entcollect.Store, 
 		}
 	}
 
-	return nil
+	return skipped.err()
 }
 
 // loadCursor reads the incremental update cursor, falling back to the
@@ -413,7 +445,7 @@ func (p *Provider) paginateUsers(ctx context.Context, cli *http.Client, key stri
 	var latest time.Time
 
 	for {
-		batch, headers, err := GetUsers(ctx, cli, p.cfg.Domain, key, query, omit, lim, log)
+		batch, headers, err := getUsers(ctx, cli, p.cfg.Domain, key, query, omit, lim, log)
 		if err != nil {
 			return nil, time.Time{}, fmt.Errorf("okta: get users: %w", err)
 		}
@@ -472,7 +504,7 @@ func (p *Provider) paginateGroups(ctx context.Context, cli *http.Client, key str
 	}
 	var all []Group
 	for {
-		batch, headers, err := GetGroups(ctx, cli, p.cfg.Domain, key, query, lim, log)
+		batch, headers, err := getGroups(ctx, cli, p.cfg.Domain, key, query, lim, log)
 		if err != nil {
 			return nil, fmt.Errorf("okta: get groups: %w", err)
 		}
@@ -497,7 +529,7 @@ func (p *Provider) paginateGroupMembers(ctx context.Context, cli *http.Client, k
 		query.Set("limit", fmt.Sprint(p.cfg.BatchSize))
 	}
 	for {
-		batch, headers, err := GetGroupMembers(ctx, cli, p.cfg.Domain, key, groupID, query, lim, log)
+		batch, headers, err := getGroupMembers(ctx, cli, p.cfg.Domain, key, groupID, query, lim, log)
 		if err != nil {
 			return nil, fmt.Errorf("okta: get group %s members: %w", groupID, err)
 		}
@@ -525,7 +557,7 @@ func (p *Provider) paginateDevices(ctx context.Context, cli *http.Client, key st
 	}
 	var all []Device
 	for {
-		batch, headers, err := GetDevices(ctx, cli, p.cfg.Domain, key, query, lim, log)
+		batch, headers, err := getDevices(ctx, cli, p.cfg.Domain, key, query, lim, log)
 		if err != nil {
 			return nil, fmt.Errorf("okta: get devices: %w", err)
 		}
@@ -553,9 +585,9 @@ func (p *Provider) paginateDevices(ctx context.Context, cli *http.Client, key st
 // context being done (ctx.Err() != nil): then the failure is propagated
 // so that a cancelled sync aborts promptly instead of warning through
 // every remaining user.
-func (p *Provider) enrichUser(ctx context.Context, cli *http.Client, key string, lim *RateLimiter, log *slog.Logger, enrich map[string]bool, permCache map[string][]Permission, u *User, fields map[string]any) error {
+func (p *Provider) enrichUser(ctx context.Context, cli *http.Client, key string, lim *RateLimiter, log *slog.Logger, enrich map[string]bool, permCache map[string][]Permission, skipped *skippedEnrichment, u *User, fields map[string]any) error {
 	if enrich["factors"] {
-		factors, _, err := GetUserFactors(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
+		factors, _, err := getUserFactors(ctx, cli, p.cfg.Domain, key, u.ID, lim, p.enrichBudget, log)
 		switch {
 		case err == nil:
 			fields["factors"] = factors
@@ -563,14 +595,19 @@ func (p *Provider) enrichUser(ctx context.Context, cli *http.Client, key string,
 			return fmt.Errorf("okta: get factors for user %s: %w", u.ID, err)
 		default:
 			log.Warn("factors enrichment failed, continuing without factors data", "user", u.ID, "error", err)
+			skipped.add("factors for user "+u.ID, err)
 		}
 	}
 	if enrich["roles"] {
-		roles, _, err := GetUserRoles(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
+		roles, _, err := getUserRoles(ctx, cli, p.cfg.Domain, key, u.ID, lim, p.enrichBudget, log)
 		switch {
 		case err == nil:
 			if enrich["permissions"] {
 				for i := range roles {
+					// Okta has permissions only for custom roles.
+					if roles[i].Type != "CUSTOM" {
+						continue
+					}
 					roleID := roles[i].RoleID
 					if roleID == "" {
 						roleID = roles[i].ID
@@ -579,12 +616,13 @@ func (p *Provider) enrichUser(ctx context.Context, cli *http.Client, key string,
 						roles[i].Permissions = cached
 						continue
 					}
-					perms, _, err := GetRolePermissions(ctx, cli, p.cfg.Domain, key, roleID, lim, log)
+					perms, _, err := getRolePermissions(ctx, cli, p.cfg.Domain, key, roleID, lim, p.enrichBudget, log)
 					if err != nil {
 						if ctx.Err() != nil {
 							return fmt.Errorf("okta: get permissions for role %s: %w", roleID, err)
 						}
 						log.Warn("permissions enrichment failed, continuing without permissions data", "user", u.ID, "role", roleID, "error", err)
+						skipped.add("permissions for role "+roleID, err)
 						continue
 					}
 					permCache[roleID] = perms
@@ -596,10 +634,11 @@ func (p *Provider) enrichUser(ctx context.Context, cli *http.Client, key string,
 			return fmt.Errorf("okta: get roles for user %s: %w", u.ID, err)
 		default:
 			log.Warn("roles enrichment failed, continuing without roles data", "user", u.ID, "error", err)
+			skipped.add("roles for user "+u.ID, err)
 		}
 	}
 	if enrich["devices"] {
-		devs, _, err := GetUserDevices(ctx, cli, p.cfg.Domain, key, u.ID, lim, log)
+		devs, _, err := getUserDevices(ctx, cli, p.cfg.Domain, key, u.ID, lim, p.enrichBudget, log)
 		switch {
 		case err == nil:
 			fields["devices"] = devs
@@ -607,9 +646,39 @@ func (p *Provider) enrichUser(ctx context.Context, cli *http.Client, key string,
 			return fmt.Errorf("okta: get devices for user %s: %w", u.ID, err)
 		default:
 			log.Warn("devices enrichment failed, continuing without devices data", "user", u.ID, "error", err)
+			skipped.add("devices for user "+u.ID, err)
 		}
 	}
 	return nil
+}
+
+// skippedEnrichment records per-user enrichment requests that failed and
+// were skipped during a sync.
+type skippedEnrichment struct {
+	n     int
+	first error
+}
+
+// add records a skipped request for what, for example "factors for user
+// 00u1". A 404 is not recorded: it means the user or role was deleted
+// after it was listed, and the next sync will not see it.
+func (s *skippedEnrichment) add(what string, err error) {
+	if errors.As(err, new(notFoundError)) {
+		return
+	}
+	if s.n == 0 {
+		s.first = fmt.Errorf("%s: %w", what, err)
+	}
+	s.n++
+}
+
+// err returns an *entcollect.IncompleteError describing the skipped
+// requests, or nil if there were none.
+func (s *skippedEnrichment) err() error {
+	if s.n == 0 {
+		return nil
+	}
+	return &entcollect.IncompleteError{Err: fmt.Errorf("okta: %d enrichment requests failed and were skipped; first: %w", s.n, s.first)}
 }
 
 // buildSupervisesMap builds a map from manager user ID to the users they
